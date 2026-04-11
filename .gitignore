@@ -1,0 +1,10 @@
+# Local secrets — copy from config.example.php
+config.php
+
+# Logs
+*.log
+
+# OS / editor
+.DS_Store
+*.swp
+*~

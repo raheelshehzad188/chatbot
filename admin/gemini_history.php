@@ -1,0 +1,400 @@
+<?php
+session_start();
+require_once '../config.php';
+
+if (!isset($_SESSION['admin_id'])) {
+    header('Location: login.php');
+    exit;
+}
+
+$conn = getDBConnection();
+$admin_id = $_SESSION['admin_id'];
+$admin_role = $_SESSION['admin_role'];
+
+// Get filter parameters
+$type_filter = $_GET['type'] ?? '';
+$phone_filter = $_GET['phone'] ?? '';
+
+// Build query based on role and filters
+if ($admin_role == 'super_admin') {
+    $query = "SELECT gh.*, a.username as admin_name FROM gemini_history gh 
+              LEFT JOIN admins a ON gh.sub_admin_id = a.id 
+              WHERE 1=1";
+    $params = [];
+    $types = [];
+    
+    if (!empty($type_filter)) {
+        $query .= " AND gh.type = ?";
+        $params[] = $type_filter;
+        $types[] = "s";
+    }
+    
+    if (!empty($phone_filter)) {
+        $query .= " AND gh.phone LIKE ?";
+        $params[] = "%$phone_filter%";
+        $types[] = "s";
+    }
+    
+    $query .= " ORDER BY gh.created_at DESC LIMIT 100";
+    
+    $stmt = $conn->prepare($query);
+    if (!empty($params)) {
+        $stmt->bind_param(implode('', $types), ...$params);
+    }
+} else {
+    $query = "SELECT gh.*, a.username as admin_name FROM gemini_history gh 
+              LEFT JOIN admins a ON gh.sub_admin_id = a.id 
+              WHERE gh.sub_admin_id = ?";
+    $params = [$admin_id];
+    $types = ["i"];
+    
+    if (!empty($type_filter)) {
+        $query .= " AND gh.type = ?";
+        $params[] = $type_filter;
+        $types[] = "s";
+    }
+    
+    if (!empty($phone_filter)) {
+        $query .= " AND gh.phone LIKE ?";
+        $params[] = "%$phone_filter%";
+        $types[] = "s";
+    }
+    
+    $query .= " ORDER BY gh.created_at DESC LIMIT 100";
+    
+    $stmt = $conn->prepare($query);
+    $stmt->bind_param(implode('', $types), ...$params);
+}
+
+$stmt->execute();
+$history = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+$stmt->close();
+$conn->close();
+?>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Gemini History</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: Arial, sans-serif;
+            background: #f5f5f5;
+        }
+        .header {
+            background: #667eea;
+            color: white;
+            padding: 20px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .header h1 { font-size: 24px; }
+        .header a {
+            color: white;
+            text-decoration: none;
+            padding: 8px 15px;
+            background: rgba(255,255,255,0.2);
+            border-radius: 5px;
+        }
+        .nav {
+            background: white;
+            padding: 15px 20px;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+        }
+        .nav a {
+            margin-right: 20px;
+            text-decoration: none;
+            color: #667eea;
+            font-weight: bold;
+        }
+        .container {
+            max-width: 1400px;
+            margin: 20px auto;
+            padding: 0 20px;
+        }
+        .filters {
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+            margin-bottom: 20px;
+        }
+        .filters form {
+            display: flex;
+            gap: 15px;
+            align-items: end;
+        }
+        .filter-group {
+            flex: 1;
+        }
+        .filter-group label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: bold;
+            color: #333;
+        }
+        .filter-group input,
+        .filter-group select {
+            width: 100%;
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+            font-size: 14px;
+        }
+        button {
+            padding: 10px 20px;
+            background: #667eea;
+            color: white;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 14px;
+        }
+        button:hover {
+            background: #5568d3;
+        }
+        table {
+            width: 100%;
+            background: white;
+            border-collapse: collapse;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+        }
+        th, td {
+            padding: 12px;
+            text-align: left;
+            border-bottom: 1px solid #eee;
+        }
+        th {
+            background: #667eea;
+            color: white;
+        }
+        .message-cell {
+            max-width: 300px;
+            word-wrap: break-word;
+        }
+        .type-badge {
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 12px;
+            font-weight: bold;
+        }
+        .type-welcome {
+            background: #d4edda;
+            color: #155724;
+        }
+        .type-reply {
+            background: #cfe2ff;
+            color: #084298;
+        }
+        .view-details {
+            padding: 5px 10px;
+            background: #667eea;
+            color: white;
+            text-decoration: none;
+            border-radius: 3px;
+            font-size: 12px;
+        }
+        .view-details:hover {
+            background: #5568d3;
+        }
+        .modal {
+            display: none;
+            position: fixed;
+            z-index: 1000;
+            left: 0;
+            top: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0,0,0,0.5);
+        }
+        .modal-content {
+            background: white;
+            margin: 5% auto;
+            padding: 30px;
+            border-radius: 8px;
+            width: 90%;
+            max-width: 800px;
+            max-height: 80vh;
+            overflow-y: auto;
+        }
+        .close {
+            color: #aaa;
+            float: right;
+            font-size: 28px;
+            font-weight: bold;
+            cursor: pointer;
+        }
+        .close:hover {
+            color: #000;
+        }
+        .detail-section {
+            margin-bottom: 20px;
+        }
+        .detail-section h3 {
+            margin-bottom: 10px;
+            color: #667eea;
+        }
+        .detail-section pre {
+            background: #f5f5f5;
+            padding: 15px;
+            border-radius: 5px;
+            overflow-x: auto;
+            font-size: 12px;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>Gemini History</h1>
+        <a href="dashboard.php">Back to Dashboard</a>
+    </div>
+    <div class="nav">
+        <a href="dashboard.php">Dashboard</a>
+        <?php if ($admin_role == 'super_admin'): ?>
+            <a href="sub_admins.php">Sub Admins</a>
+        <?php endif; ?>
+        <a href="leads.php">Leads</a>
+        <a href="chatgpt_history.php">ChatGPT History</a>
+        <a href="gemini_history.php">Gemini History</a>
+        <a href="whatsapp_history.php">WhatsApp History</a>
+        <a href="settings.php">Settings</a>
+    </div>
+    <div class="container">
+        <div class="filters">
+            <form method="GET">
+                <div class="filter-group">
+                    <label>Type</label>
+                    <select name="type">
+                        <option value="">All Types</option>
+                        <option value="welcome" <?php echo $type_filter == 'welcome' ? 'selected' : ''; ?>>Welcome</option>
+                        <option value="reply" <?php echo $type_filter == 'reply' ? 'selected' : ''; ?>>Reply</option>
+                    </select>
+                </div>
+                <div class="filter-group">
+                    <label>Phone Number</label>
+                    <input type="text" name="phone" value="<?php echo htmlspecialchars($phone_filter); ?>" placeholder="Search by phone...">
+                </div>
+                <button type="submit">Filter</button>
+                <a href="gemini_history.php" style="padding: 10px 20px; background: #6c757d; color: white; text-decoration: none; border-radius: 5px; display: inline-block;">Reset</a>
+            </form>
+        </div>
+        
+        <table>
+            <thead>
+                <tr>
+                    <th>ID</th>
+                    <th>Type</th>
+                    <th>Phone</th>
+                    <th>Name</th>
+                    <?php if ($admin_role == 'super_admin'): ?>
+                        <th>Sub Admin</th>
+                    <?php endif; ?>
+                    <th>Incoming Message</th>
+                    <th>Generated Message</th>
+                    <th>Time</th>
+                    <th>Action</th>
+                </tr>
+            </thead>
+            <tbody>
+                <?php if (empty($history)): ?>
+                    <tr>
+                        <td colspan="<?php echo $admin_role == 'super_admin' ? '9' : '8'; ?>" style="text-align: center; padding: 30px;">
+                            No Gemini history found
+                        </td>
+                    </tr>
+                <?php else: ?>
+                    <?php foreach ($history as $item): ?>
+                        <tr>
+                            <td><?php echo $item['id']; ?></td>
+                            <td>
+                                <span class="type-badge type-<?php echo $item['type']; ?>">
+                                    <?php echo ucfirst($item['type']); ?>
+                                </span>
+                            </td>
+                            <td><?php echo htmlspecialchars($item['phone'] ?: 'N/A'); ?></td>
+                            <td><?php echo htmlspecialchars($item['name'] ?: 'N/A'); ?></td>
+                            <?php if ($admin_role == 'super_admin'): ?>
+                                <td><?php echo htmlspecialchars($item['admin_name'] ?? 'N/A'); ?></td>
+                            <?php endif; ?>
+                            <td class="message-cell"><?php echo htmlspecialchars(substr($item['incoming_message'], 0, 100) . (strlen($item['incoming_message']) > 100 ? '...' : '')); ?></td>
+                            <td class="message-cell"><?php echo htmlspecialchars(substr($item['generated_message'], 0, 100) . (strlen($item['generated_message']) > 100 ? '...' : '')); ?></td>
+                            <td><?php echo date('Y-m-d H:i:s', strtotime($item['created_at'])); ?></td>
+                            <td>
+                                <a href="#" class="view-details" onclick="showDetails(<?php echo htmlspecialchars(json_encode($item)); ?>); return false;">View Details</a>
+                            </td>
+                        </tr>
+                    <?php endforeach; ?>
+                <?php endif; ?>
+            </tbody>
+        </table>
+    </div>
+    
+    <!-- Modal for details -->
+    <div id="detailsModal" class="modal">
+        <div class="modal-content">
+            <span class="close" onclick="closeModal()">&times;</span>
+            <div id="modalBody"></div>
+        </div>
+    </div>
+    
+    <script>
+        function showDetails(item) {
+            const modal = document.getElementById('detailsModal');
+            const body = document.getElementById('modalBody');
+            
+            let html = '<h2>Gemini Request Details</h2>';
+            html += '<div class="detail-section">';
+            html += '<h3>Basic Information</h3>';
+            html += '<p><strong>ID:</strong> ' + item.id + '</p>';
+            html += '<p><strong>Type:</strong> ' + item.type + '</p>';
+            html += '<p><strong>Phone:</strong> ' + (item.phone || 'N/A') + '</p>';
+            html += '<p><strong>Name:</strong> ' + (item.name || 'N/A') + '</p>';
+            html += '<p><strong>Created At:</strong> ' + item.created_at + '</p>';
+            html += '<p><strong>HTTP Code:</strong> ' + (item.http_code || 'N/A') + '</p>';
+            html += '<p><strong>API Time:</strong> ' + (item.api_time ? item.api_time + ' seconds' : 'N/A') + '</p>';
+            if (item.error) {
+                html += '<p><strong>Error:</strong> <span style="color: red;">' + item.error + '</span></p>';
+            }
+            html += '</div>';
+            
+            html += '<div class="detail-section">';
+            html += '<h3>Incoming Message</h3>';
+            html += '<pre>' + (item.incoming_message || 'N/A') + '</pre>';
+            html += '</div>';
+            
+            html += '<div class="detail-section">';
+            html += '<h3>Generated Message</h3>';
+            html += '<pre>' + item.generated_message + '</pre>';
+            html += '</div>';
+            
+            html += '<div class="detail-section">';
+            html += '<h3>Request Payload</h3>';
+            html += '<pre>' + JSON.stringify(JSON.parse(item.request_payload), null, 2) + '</pre>';
+            html += '</div>';
+            
+            html += '<div class="detail-section">';
+            html += '<h3>Response Data</h3>';
+            html += '<pre>' + JSON.stringify(JSON.parse(item.response_data), null, 2) + '</pre>';
+            html += '</div>';
+            
+            body.innerHTML = html;
+            modal.style.display = 'block';
+        }
+        
+        function closeModal() {
+            document.getElementById('detailsModal').style.display = 'none';
+        }
+        
+        window.onclick = function(event) {
+            const modal = document.getElementById('detailsModal');
+            if (event.target == modal) {
+                modal.style.display = 'none';
+            }
+        }
+    </script>
+</body>
+</html>
+
