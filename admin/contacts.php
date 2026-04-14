@@ -12,6 +12,34 @@ $conn = getDBConnection();
 $admin_id = (int) $_SESSION['admin_id'];
 $admin_role = $_SESSION['admin_role'];
 $message = '';
+$didToggle = false;
+
+/**
+ * Comma-separated ignore list parser for this page.
+ * Example stored value: 123456,654321,923001112233
+ *
+ * @param string $raw
+ * @return array<int, string>
+ */
+function getIgnoreSuffixesFromComma($raw) {
+    $tokens = explode(',', (string) $raw);
+    $suffixes = [];
+    foreach ($tokens as $token) {
+        $token = trim($token);
+        if ($token === '') {
+            continue;
+        }
+        $digits = normalizePhoneDigits($token);
+        if ($digits === '') {
+            continue;
+        }
+        $suffix = strlen($digits) <= 6 ? $digits : substr($digits, -6);
+        if ($suffix !== '') {
+            $suffixes[$suffix] = true;
+        }
+    }
+    return array_keys($suffixes);
+}
 
 // Backward-compatible: add ignore_numbers column if missing
 if ($col = $conn->query("SHOW COLUMNS FROM sub_admin_settings LIKE 'ignore_numbers'")) {
@@ -23,6 +51,7 @@ if ($col = $conn->query("SHOW COLUMNS FROM sub_admin_settings LIKE 'ignore_numbe
 // Toggle ignore / unignore for a contact
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['toggle_ignore'])) {
     $lead_id = (int) ($_POST['lead_id'] ?? 0);
+    $targetAction = $_POST['target_action'] ?? 'toggle'; // ignore | back | toggle
     if ($lead_id > 0) {
         if ($admin_role === 'super_admin') {
             $leadStmt = $conn->prepare("SELECT id, sub_admin_id, phone FROM leads WHERE id = ? LIMIT 1");
@@ -45,30 +74,53 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['toggle_ignore'])) {
             $settingsRow = $setStmt->get_result()->fetch_assoc();
             $setStmt->close();
 
+            // If settings row is missing for this owner, create it first so ignore list can be persisted.
+            if (!$settingsRow) {
+                $newWebhookToken = bin2hex(random_bytes(32));
+                $insSettings = $conn->prepare("INSERT INTO sub_admin_settings (admin_id, webhook_token, ignore_numbers) VALUES (?, ?, '')");
+                $insSettings->bind_param("is", $targetSubAdmin, $newWebhookToken);
+                $insSettings->execute();
+                $insSettings->close();
+                $settingsRow = ['ignore_numbers' => ''];
+            }
+
             $rawIgnore = $settingsRow['ignore_numbers'] ?? '';
-            $suffixes = parseIgnoreNumberSuffixes($rawIgnore);
+            $suffixes = getIgnoreSuffixesFromComma($rawIgnore);
 
             if ($phoneSuffix !== '') {
-                if (in_array($phoneSuffix, $suffixes, true)) {
-                    $suffixes = array_values(array_filter($suffixes, function ($v) use ($phoneSuffix) {
-                        return $v !== $phoneSuffix;
-                    }));
+                $alreadyIgnored = in_array($phoneSuffix, $suffixes, true);
+                $shouldRemove = ($targetAction === 'back') || ($targetAction === 'toggle' && $alreadyIgnored);
+                $shouldAdd = ($targetAction === 'ignore') || ($targetAction === 'toggle' && !$alreadyIgnored);
+                if ($shouldRemove && $alreadyIgnored) {
+                    $index = array_search($phoneSuffix, $suffixes, true);
+                    unset($suffixes[$index]);
                     $message = "Number removed from ignore list.";
-                } else {
+                } elseif ($shouldAdd && !$alreadyIgnored) {
                     $suffixes[] = $phoneSuffix;
                     $suffixes = array_values(array_unique($suffixes));
                     $message = "Number added to ignore list.";
+                } else {
+                    $message = "No changes needed.";
                 }
                 sort($suffixes);
-                $newIgnore = implode("\n", $suffixes);
+                $newIgnore = implode(',', $suffixes);
 
                 $upd = $conn->prepare("UPDATE sub_admin_settings SET ignore_numbers = ? WHERE admin_id = ?");
                 $upd->bind_param("si", $newIgnore, $targetSubAdmin);
                 $upd->execute();
                 $upd->close();
+                $didToggle = true;
             }
         }
     }
+}
+
+if ($didToggle) {
+    header('Location: contacts.php?updated=1');
+    exit;
+}
+if (isset($_GET['updated'])) {
+    $message = 'Ignore list updated successfully.';
 }
 
 // Load contacts with per-sub-admin ignore list
@@ -189,7 +241,8 @@ $conn->close();
                     <?php foreach ($contacts as $c): ?>
                         <?php
                             $suffix = getPhoneLastSix($c['phone']);
-                            $ignored = isIgnoredPhone($c['phone'], $c['ignore_numbers'] ?? '');
+                            $ignoreSuffixes = getIgnoreSuffixesFromComma($c['ignore_numbers'] ?? '');
+                            $ignored = ($suffix !== '' && in_array($suffix, $ignoreSuffixes, true));
                         ?>
                         <tr>
                             <td><?php echo (int) $c['id']; ?></td>
@@ -200,7 +253,8 @@ $conn->close();
                                 <td><?php echo htmlspecialchars($c['admin_name'] ?? 'N/A'); ?></td>
                             <?php endif; ?>
                             <td>
-                                <?php if ($ignored): ?>
+                                <?php 
+                                if ($ignored): ?>
                                     <span class="badge badge-yes">Yes</span>
                                 <?php else: ?>
                                     <span class="badge badge-no">No</span>
@@ -210,8 +264,9 @@ $conn->close();
                             <td>
                                 <form method="POST" style="display:inline;">
                                     <input type="hidden" name="lead_id" value="<?php echo (int) $c['id']; ?>">
+                                    <input type="hidden" name="target_action" value="<?php echo $ignored ? 'back' : 'ignore'; ?>">
                                     <button type="submit" name="toggle_ignore" value="1" class="btn <?php echo $ignored ? 'btn-unignore' : 'btn-ignore'; ?>">
-                                        <?php echo $ignored ? 'Remove Ignore' : 'Ignore'; ?>
+                                        <?php echo $ignored ? 'Back' : 'Ignore'; ?>
                                     </button>
                                 </form>
                             </td>

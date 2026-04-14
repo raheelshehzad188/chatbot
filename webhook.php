@@ -63,13 +63,48 @@ if ($result && isset($result['text']) && isset($result['number'])) {
     }
 
     // Ignore-list check (per sub-admin): match by last 6 digits
+    // We check multiple possible sender numbers because some payloads have both
+    // cleanedSenderPn and remoteJid variants.
     $ignoreListRaw = $settings['ignore_numbers'] ?? '';
-    if (isIgnoredPhone($phone, $ignoreListRaw)) {
+    $ignoreCandidates = [$phone];
+    if (isset($data['data']['messages']['key']['cleanedSenderPn'])) {
+        $ignoreCandidates[] = $data['data']['messages']['key']['cleanedSenderPn'];
+    }
+    if (isset($data['data']['messages']['remoteJid'])) {
+        $ignoreCandidates[] = explode('@', $data['data']['messages']['remoteJid'])[0];
+    }
+    if (isset($data['data']['messages']['key']['remoteJid'])) {
+        $ignoreCandidates[] = explode('@', $data['data']['messages']['key']['remoteJid'])[0];
+    }
+    if (isset($data['messages']['key']['cleanedSenderPn'])) {
+        $ignoreCandidates[] = $data['messages']['key']['cleanedSenderPn'];
+    }
+    if (isset($data['messages']['remoteJid'])) {
+        $ignoreCandidates[] = explode('@', $data['messages']['remoteJid'])[0];
+    }
+    if (isset($data['messages']['key']['remoteJid'])) {
+        $ignoreCandidates[] = explode('@', $data['messages']['key']['remoteJid'])[0];
+    }
+    $ignoreCandidates = array_values(array_unique(array_filter($ignoreCandidates)));
+
+    $matchedIgnorePhone = '';
+    foreach ($ignoreCandidates as $candidatePhone) {
+        if (isIgnoredPhone($candidatePhone, $ignoreListRaw)) {
+            $matchedIgnorePhone = $candidatePhone;
+            break;
+        }
+    }
+
+    if ($matchedIgnorePhone !== '') {
         $conn->close();
         http_response_code(200);
         echo json_encode([
             'status' => 'ignored',
-            'message' => 'Phone matched ignore list (last 6 digits)'
+            'message' => 'Number is in ignore list. Queue and reply skipped.',
+            'reason' => 'ignore_list',
+            'matched_phone' => $matchedIgnorePhone,
+            'matched_last6' => getPhoneLastSix($matchedIgnorePhone),
+            'queue_added' => false
         ]);
         exit;
     }
@@ -174,10 +209,18 @@ if ($result && isset($result['text']) && isset($result['number'])) {
     saveChatHistory($phone, $text, $result);
     
     $conn->close();
+
+    // Trigger queue processing immediately after webhook handling.
+    // This helps instant replies when queue was empty and message got scheduled for now.
+    $processed_now = processMessageQueue(5);
     
     // Return success response
     http_response_code(200);
-    echo json_encode(['status' => 'success', 'message' => 'Processed']);
+    echo json_encode([
+        'status' => 'success',
+        'message' => 'Processed',
+        'queue_processed_now' => $processed_now
+    ]);
 } else {
     // Invalid data
     http_response_code(400);

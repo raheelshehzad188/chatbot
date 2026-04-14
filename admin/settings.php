@@ -253,7 +253,7 @@ $webhook_url = base_url('webhook.php?token=' . ($settings['webhook_token'] ?? ''
                 <div class="form-group">
                     <label>Ignore Numbers List (last 6 digits match)</label>
                     <textarea name="ignore_numbers" placeholder="e.g. 923001112233&#10;03001234567&#10;111222"><?php echo htmlspecialchars($settings['ignore_numbers'] ?? ''); ?></textarea>
-                    <div class="help-text">One number per line (or comma separated). If incoming WhatsApp number last 6 digits match this list, bot will not send any reply.</div>
+                    <div class="help-text">Comma separated format recommended (example: 923001112233,03001234567,111222). If incoming WhatsApp number last 6 digits match this list, bot will not send any reply.</div>
                 </div>
                 
                 <div class="form-group">
