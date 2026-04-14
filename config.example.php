@@ -28,6 +28,9 @@ if ($isLocalhost) {
 // API Keys Configuration — set your keys here
 define('GEMINI_API_KEY', '');
 define('WHATSAPP_API_TOKEN', '');
+if (!defined('GEMINI_MODEL')) {
+    define('GEMINI_MODEL', 'gemini-3-flash-preview');
+}
 
 function base_url($uri = '') {
     $protocol = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off' ||
@@ -48,4 +51,28 @@ function getDBConnection() {
         die("Connection failed: " . $conn->connect_error);
     }
     return $conn;
+}
+
+function getPDOConnection() {
+    static $pdo = null;
+    if ($pdo === null) {
+        $dsn = 'mysql:host=' . DB_HOST . ';dbname=' . DB_NAME . ';charset=utf8mb4';
+        $pdo = new PDO($dsn, DB_USER, DB_PASS, [
+            PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+            PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+        ]);
+    }
+    return $pdo;
+}
+
+function getGeminiApiUrl($apiKey, $model = null) {
+    $finalModel = $model ?: (defined('GEMINI_MODEL') ? GEMINI_MODEL : 'gemini-3-flash-preview');
+    return 'https://generativelanguage.googleapis.com/v1beta/models/'
+        . $finalModel
+        . ':generateContent?key='
+        . rawurlencode($apiKey);
+}
+
+if (!defined('GEMINI_USE_FUNCTION_CALLING')) {
+    define('GEMINI_USE_FUNCTION_CALLING', false);
 }

@@ -1,6 +1,21 @@
 <?php
 require_once 'config.php';
 
+if (!function_exists('dd')) {
+    /**
+     * Laravel-style dump and die helper.
+     */
+    function dd(...$vars) {
+        http_response_code(200);
+        echo '<pre style="background:#111;color:#f8f8f2;padding:12px;border-radius:6px;overflow:auto;">';
+        foreach ($vars as $var) {
+            var_dump($var);
+        }
+        echo '</pre>';
+        exit;
+    }
+}
+
 /**
  * Process incoming data - Extract name, number and message from WhatsApp webhook
  * Returns an array with 'text', 'number', and 'name' keys
@@ -118,6 +133,61 @@ function processIncomingData($data) {
 }
 
 /**
+ * Normalize phone into digits only.
+ */
+function normalizePhoneDigits($phone) {
+    return preg_replace('/\D+/', '', (string)$phone);
+}
+
+/**
+ * Get last 6 digits from a phone number.
+ */
+function getPhoneLastSix($phone) {
+    $digits = normalizePhoneDigits($phone);
+    if ($digits === '') {
+        return '';
+    }
+    return strlen($digits) <= 6 ? $digits : substr($digits, -6);
+}
+
+/**
+ * Parse ignore list text (comma/newline/space separated) and return unique last-6 suffixes.
+ *
+ * @param string $raw
+ * @return array<int, string>
+ */
+function parseIgnoreNumberSuffixes($raw) {
+    $parts = preg_split('/[\s,;]+/', (string)$raw);
+    if (!is_array($parts)) {
+        return [];
+    }
+    $suffixes = [];
+    foreach ($parts as $part) {
+        $digits = normalizePhoneDigits($part);
+        if ($digits === '') {
+            continue;
+        }
+        $suffix = strlen($digits) <= 6 ? $digits : substr($digits, -6);
+        if ($suffix !== '') {
+            $suffixes[$suffix] = true;
+        }
+    }
+    return array_keys($suffixes);
+}
+
+/**
+ * Check whether incoming phone should be ignored for this sub-admin.
+ */
+function isIgnoredPhone($incomingPhone, $ignoreListRaw) {
+    $incomingSuffix = getPhoneLastSix($incomingPhone);
+    if ($incomingSuffix === '') {
+        return false;
+    }
+    $ignoreSuffixes = parseIgnoreNumberSuffixes($ignoreListRaw);
+    return in_array($incomingSuffix, $ignoreSuffixes, true);
+}
+
+/**
  * Check if phone number exists in leads table for specific sub-admin
  */
 function checkPhoneExists($phone, $sub_admin_id) {
@@ -148,6 +218,9 @@ function insertLead($phone, $message, $sub_admin_id, $name = '') {
  * Get welcome message for new leads using AI
  */
 function getWelcomeMessage($name = '', $settings = null) {
+    if ($settings !== null) {
+        $settings = mergePlatformAiSettings($settings);
+    }
     // Determine which API provider to use
     $apiProvider = ($settings && !empty($settings['api_provider'])) ? $settings['api_provider'] : 'gemini';
     
@@ -185,7 +258,8 @@ function getWelcomeMessage($name = '', $settings = null) {
  */
 function getGeminiWelcomeMessage($prompt, $name, $settings = null) {
     $apiKey = ($settings && !empty($settings['gemini_api_key'])) ? $settings['gemini_api_key'] : GEMINI_API_KEY;
-    $apiUrl = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=' . $apiKey;
+    $model = ($settings && !empty($settings['gemini_model'])) ? $settings['gemini_model'] : null;
+    $apiUrl = getGeminiApiUrl($apiKey, $model);
     
     // Prompt already includes instructions from getWelcomeMessage, use it directly
     $fullPrompt = $prompt;
@@ -566,6 +640,9 @@ function getChatHistory($phone, $sub_admin_id, $limit = 50) {
  * Get reply message using Google Gemini or ChatGPT API with sub-admin settings
  */
 function getReplyMessage($incomingMessage, $phone, $settings = null) {
+    if ($settings !== null) {
+        $settings = mergePlatformAiSettings($settings);
+    }
     $startTime = microtime(true);
     
     // Determine which API provider to use
@@ -584,7 +661,12 @@ function getReplyMessage($incomingMessage, $phone, $settings = null) {
         $reply = getChatGPTReply($incomingMessage, $phone, $settings);
         
     } else {
-        $reply = getGeminiReply($incomingMessage, $phone, $settings);
+        if (defined('GEMINI_USE_FUNCTION_CALLING') && GEMINI_USE_FUNCTION_CALLING) {
+            require_once __DIR__ . '/classes/GeminiFunctionCalling.php';
+            $reply = getGeminiReplyWithTools($incomingMessage, $phone, $settings);
+        } else {
+            $reply = getGeminiReply($incomingMessage, $phone, $settings);
+        }
     }
     
     $totalTime = microtime(true) - $startTime;
@@ -609,7 +691,8 @@ function getGeminiReply($incomingMessage, $phone, $settings = null) {
     
     // Use sub-admin's API key if provided, otherwise use default
     $apiKey = ($settings && !empty($settings['gemini_api_key'])) ? $settings['gemini_api_key'] : GEMINI_API_KEY;
-    $apiUrl = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=' . $apiKey;
+    $model = ($settings && !empty($settings['gemini_model'])) ? $settings['gemini_model'] : null;
+    $apiUrl = getGeminiApiUrl($apiKey, $model);
     
     // Prepare message with starting message if available
     $fullMessage = '';
@@ -617,7 +700,7 @@ function getGeminiReply($incomingMessage, $phone, $settings = null) {
         $fullMessage = $settings['starting_message'] . ' client msg: ' . $incomingMessage;
     } else {
         // Default starting message
-        $fullMessage = 'ap as a assistent kam kr rae ho london asthetics uk site k lwea ap ne us related reply dna ha,https://londonaesthetics.com.pk/ ye website ha hmri so ap yhn sa check kr skta ho hr chz yr sagr client end mn text kre to ap ne eng mn reply krna means multi language mn. agre clinic related bt ni ha to to ap reply mn stop bhjna  client msg:'.$incomingMessage;
+        $fullMessage = 'ap as a chatbot kam kr rae ho '.$incomingMessage;
     }
     
     // Prepare request data

@@ -255,8 +255,10 @@ $conn->close();
         <a href="dashboard.php">Dashboard</a>
         <?php if ($admin_role == 'super_admin'): ?>
             <a href="sub_admins.php">Sub Admins</a>
+            <a href="platform_ai.php">Platform AI</a>
         <?php endif; ?>
         <a href="leads.php">Leads</a>
+        <a href="contacts.php">Contacts</a>
         <a href="chatgpt_history.php">ChatGPT History</a>
         <a href="gemini_history.php">Gemini History</a>
         <a href="whatsapp_history.php">WhatsApp History</a>

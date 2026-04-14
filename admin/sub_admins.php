@@ -9,6 +9,61 @@ if (!isset($_SESSION['admin_id']) || $_SESSION['admin_role'] != 'super_admin') {
 
 $conn = getDBConnection();
 $message = '';
+$edit_admin = null;
+$edit_id = isset($_GET['edit']) ? (int) $_GET['edit'] : 0;
+
+// Handle update sub-admin
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['update_admin'])) {
+    $edit_id_post = (int) ($_POST['edit_id'] ?? 0);
+    $username = trim($_POST['username'] ?? '');
+    $email = $_POST['email'] ?? '';
+    $status = ($_POST['status'] ?? 'active') === 'inactive' ? 'inactive' : 'active';
+    $password = $_POST['password'] ?? '';
+
+    if ($edit_id_post <= 0 || $username === '') {
+        $message = 'Invalid update request.';
+    } else {
+        $chk = $conn->prepare("SELECT id FROM admins WHERE id = ? AND role = 'sub_admin'");
+        $chk->bind_param('i', $edit_id_post);
+        $chk->execute();
+        $exists = $chk->get_result()->num_rows > 0;
+        $chk->close();
+
+        if (!$exists) {
+            $message = 'Sub-admin not found.';
+        } else {
+            $dup = $conn->prepare("SELECT id FROM admins WHERE username = ? AND id != ?");
+            $dup->bind_param('si', $username, $edit_id_post);
+            $dup->execute();
+            if ($dup->get_result()->num_rows > 0) {
+                $message = 'That username is already taken.';
+                $dup->close();
+            } else {
+                $dup->close();
+                if ($password !== '') {
+                    $hash = password_hash($password, PASSWORD_DEFAULT);
+                    $stmt = $conn->prepare("UPDATE admins SET username = ?, email = ?, status = ?, password = ? WHERE id = ? AND role = 'sub_admin'");
+                    $stmt->bind_param('ssssi', $username, $email, $status, $hash, $edit_id_post);
+                } else {
+                    $stmt = $conn->prepare("UPDATE admins SET username = ?, email = ?, status = ? WHERE id = ? AND role = 'sub_admin'");
+                    $stmt->bind_param('sssi', $username, $email, $status, $edit_id_post);
+                }
+                if ($stmt->execute()) {
+                    $stmt->close();
+                    $conn->close();
+                    header('Location: sub_admins.php?updated=1');
+                    exit;
+                }
+                $message = 'Could not update sub-admin.';
+                $stmt->close();
+            }
+        }
+    }
+}
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['update_admin']) && $message !== '') {
+    $edit_id = (int) ($_POST['edit_id'] ?? 0);
+}
 
 // Handle add sub-admin
 if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['add_admin'])) {
@@ -47,6 +102,22 @@ if (isset($_GET['delete'])) {
     $stmt->close();
     header('Location: sub_admins.php');
     exit;
+}
+
+if (isset($_GET['updated'])) {
+    $message = 'Sub-admin updated successfully.';
+}
+
+// Row being edited (for form)
+if ($edit_id > 0) {
+    $est = $conn->prepare("SELECT id, username, email, status FROM admins WHERE id = ? AND role = 'sub_admin'");
+    $est->bind_param('i', $edit_id);
+    $est->execute();
+    $edit_admin = $est->get_result()->fetch_assoc();
+    $est->close();
+    if (!$edit_admin) {
+        $edit_id = 0;
+    }
 }
 
 // Get all sub-admins
@@ -162,6 +233,21 @@ $conn->close();
             border-radius: 3px;
             font-size: 12px;
         }
+        .btn-edit {
+            background: #28a745;
+            color: white;
+            padding: 5px 10px;
+            text-decoration: none;
+            border-radius: 3px;
+            font-size: 12px;
+            margin-right: 6px;
+        }
+        .form-group select {
+            width: 100%;
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+        }
         .webhook-url {
             font-size: 11px;
             color: #666;
@@ -177,7 +263,9 @@ $conn->close();
     <div class="nav">
         <a href="dashboard.php">Dashboard</a>
         <a href="sub_admins.php">Sub Admins</a>
+        <a href="platform_ai.php">Platform AI</a>
         <a href="leads.php">Leads</a>
+        <a href="contacts.php">Contacts</a>
         <a href="settings.php">Settings</a>
     </div>
     <div class="container">
@@ -185,6 +273,35 @@ $conn->close();
             <div class="message"><?php echo htmlspecialchars($message); ?></div>
         <?php endif; ?>
         
+        <?php if ($edit_admin): ?>
+        <div class="form-container">
+            <h2>Edit Sub-Admin: <?php echo htmlspecialchars($edit_admin['username']); ?></h2>
+            <form method="POST" action="sub_admins.php?edit=<?php echo (int) $edit_admin['id']; ?>">
+                <input type="hidden" name="edit_id" value="<?php echo (int) $edit_admin['id']; ?>">
+                <div class="form-group">
+                    <label>Username</label>
+                    <input type="text" name="username" required value="<?php echo htmlspecialchars($edit_admin['username']); ?>">
+                </div>
+                <div class="form-group">
+                    <label>Email</label>
+                    <input type="email" name="email" value="<?php echo htmlspecialchars($edit_admin['email'] ?? ''); ?>">
+                </div>
+                <div class="form-group">
+                    <label>Status</label>
+                    <select name="status">
+                        <option value="active" <?php echo (($edit_admin['status'] ?? '') === 'active') ? 'selected' : ''; ?>>Active</option>
+                        <option value="inactive" <?php echo (($edit_admin['status'] ?? '') === 'inactive') ? 'selected' : ''; ?>>Inactive</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>New password</label>
+                    <input type="password" name="password" placeholder="Leave blank to keep current password" autocomplete="new-password">
+                </div>
+                <button type="submit" name="update_admin" value="1">Save changes</button>
+                <a href="sub_admins.php" style="margin-left: 12px;">Cancel</a>
+            </form>
+        </div>
+        <?php else: ?>
         <div class="form-container">
             <h2>Add New Sub-Admin</h2>
             <form method="POST">
@@ -203,6 +320,7 @@ $conn->close();
                 <button type="submit" name="add_admin">Add Sub-Admin</button>
             </form>
         </div>
+        <?php endif; ?>
         
         <h2 style="margin-bottom: 15px;">All Sub-Admins</h2>
         <table>
@@ -214,7 +332,7 @@ $conn->close();
                     <th>Webhook Token</th>
                     <th>Webhook URL</th>
                     <th>Status</th>
-                    <th>Action</th>
+                    <th>Actions</th>
                 </tr>
             </thead>
             <tbody>
@@ -241,7 +359,8 @@ $conn->close();
                             </td>
                             <td><?php echo ucfirst($admin['status']); ?></td>
                             <td>
-                                <a href="?delete=<?php echo $admin['id']; ?>" class="btn-danger" onclick="return confirm('Are you sure?')">Delete</a>
+                                <a href="?edit=<?php echo (int) $admin['id']; ?>" class="btn-edit">Edit</a>
+                                <a href="?delete=<?php echo (int) $admin['id']; ?>" class="btn-danger" onclick="return confirm('Delete this sub-admin and all related data?')">Delete</a>
                             </td>
                         </tr>
                     <?php endforeach; ?>

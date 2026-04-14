@@ -11,6 +11,13 @@ $conn = getDBConnection();
 $admin_id = $_SESSION['admin_id'];
 $message = '';
 
+// Backward-compatible: create ignore_numbers column if migration not yet run
+if ($col = $conn->query("SHOW COLUMNS FROM sub_admin_settings LIKE 'ignore_numbers'")) {
+    if ($col->num_rows === 0) {
+        @$conn->query("ALTER TABLE sub_admin_settings ADD COLUMN ignore_numbers TEXT DEFAULT '' AFTER system_instruction");
+    }
+}
+
 // Get current settings
 $settings_query = "SELECT * FROM sub_admin_settings WHERE admin_id = ?";
 $stmt = $conn->prepare($settings_query);
@@ -35,22 +42,20 @@ if (!$settings) {
     $stmt->close();
 }
 
-// Handle update
+// Handle update (store owners: WhatsApp + prompts only — AI keys are platform-wide)
 if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['update_settings'])) {
-    $api_provider = $_POST['api_provider'] ?? 'gemini';
-    $gemini_key = $_POST['gemini_api_key'] ?? '';
-    $chatgpt_key = $_POST['chatgpt_api_key'] ?? '';
     $whatsapp_token = $_POST['whatsapp_api_token'] ?? '';
     $starting_message = $_POST['starting_message'] ?? '';
     $system_instruction = $_POST['system_instruction'] ?? '';
+    $ignore_numbers = $_POST['ignore_numbers'] ?? '';
     $message_interval = isset($_POST['message_interval']) ? (int)$_POST['message_interval'] : 60;
     
     // Validate message_interval (minimum 10 seconds, maximum 600 seconds)
     if ($message_interval < 10) $message_interval = 10;
     if ($message_interval > 600) $message_interval = 600;
     
-    $update_stmt = $conn->prepare("UPDATE sub_admin_settings SET api_provider = ?, gemini_api_key = ?, chatgpt_api_key = ?, whatsapp_api_token = ?, starting_message = ?, system_instruction = ?, message_interval = ? WHERE admin_id = ?");
-    $update_stmt->bind_param("ssssssii", $api_provider, $gemini_key, $chatgpt_key, $whatsapp_token, $starting_message, $system_instruction, $message_interval, $admin_id);
+    $update_stmt = $conn->prepare("UPDATE sub_admin_settings SET whatsapp_api_token = ?, starting_message = ?, system_instruction = ?, ignore_numbers = ?, message_interval = ? WHERE admin_id = ?");
+    $update_stmt->bind_param("ssssii", $whatsapp_token, $starting_message, $system_instruction, $ignore_numbers, $message_interval, $admin_id);
     
     if ($update_stmt->execute()) {
         $message = "Settings updated successfully!";
@@ -199,8 +204,10 @@ $webhook_url = base_url('webhook.php?token=' . ($settings['webhook_token'] ?? ''
         <a href="dashboard.php">Dashboard</a>
         <?php if ($_SESSION['admin_role'] == 'super_admin'): ?>
             <a href="sub_admins.php">Sub Admins</a>
+            <a href="platform_ai.php">Platform AI</a>
         <?php endif; ?>
         <a href="leads.php">Leads</a>
+        <a href="contacts.php">Contacts</a>
         <a href="chatgpt_history.php">ChatGPT History</a>
         <a href="gemini_history.php">Gemini History</a>
         <a href="whatsapp_history.php">WhatsApp History</a>
@@ -212,7 +219,17 @@ $webhook_url = base_url('webhook.php?token=' . ($settings['webhook_token'] ?? ''
         <?php endif; ?>
         
         <div class="form-container">
-            <h2 style="margin-bottom: 20px;">API Configuration</h2>
+            <h2 style="margin-bottom: 20px;">Store configuration</h2>
+
+            <p style="margin-bottom: 16px; color: #555; font-size: 14px; line-height: 1.5;">
+                Gemini / OpenAI keys and the <strong>which AI to use</strong> choice are set once for the whole platform by the super admin in
+                <?php if ($_SESSION['admin_role'] == 'super_admin'): ?>
+                    <a href="platform_ai.php"><strong>Platform AI</strong></a>.
+                <?php else: ?>
+                    <strong>Platform AI</strong> (super admin only).
+                <?php endif; ?>
+                Here you only set <strong>WhatsApp</strong> and your store prompts.
+            </p>
             
             <div class="webhook-info">
                 <strong>Your Webhook URL:</strong>
@@ -222,42 +239,27 @@ $webhook_url = base_url('webhook.php?token=' . ($settings['webhook_token'] ?? ''
             
             <form method="POST" id="settingsForm">
                 <div class="form-group">
-                    <label>API Provider</label>
-                    <select name="api_provider" id="api_provider" required>
-                        <option value="gemini" <?php echo (($settings['api_provider'] ?? 'gemini') == 'gemini') ? 'selected' : ''; ?>>Gemini</option>
-                        <option value="chatgpt" <?php echo (($settings['api_provider'] ?? 'gemini') == 'chatgpt') ? 'selected' : ''; ?>>ChatGPT</option>
-                    </select>
-                    <div class="help-text">Select which AI API to use for generating responses</div>
+                    <label>Starting message (Gemini / prepended context)</label>
+                    <textarea name="starting_message" placeholder="Optional context prepended when the platform uses Gemini..."><?php echo htmlspecialchars($settings['starting_message'] ?? ''); ?></textarea>
+                    <div class="help-text">Used when the platform AI provider is Gemini (or as extra context). Does not replace the platform API key.</div>
                 </div>
-                
-                <div class="form-group api-key-group <?php echo (($settings['api_provider'] ?? 'gemini') == 'gemini') ? 'show' : ''; ?>" id="gemini_key_group">
-                    <label>Gemini API Key</label>
-                    <input type="text" name="gemini_api_key" value="<?php echo htmlspecialchars($settings['gemini_api_key'] ?? ''); ?>" placeholder="Enter your Gemini API Key">
-                    <div class="help-text">Your Google Gemini API key for AI responses</div>
+
+                <div class="form-group">
+                    <label>System instruction (ChatGPT)</label>
+                    <textarea name="system_instruction" placeholder="Role and behavior when the platform uses OpenAI..."><?php echo htmlspecialchars($settings['system_instruction'] ?? ''); ?></textarea>
+                    <div class="help-text">Used when the platform AI provider is ChatGPT. Per-store personality; keys stay on Platform AI.</div>
                 </div>
-                
-                <div class="form-group api-key-group <?php echo (($settings['api_provider'] ?? 'gemini') == 'chatgpt') ? 'show' : ''; ?>" id="chatgpt_key_group">
-                    <label>ChatGPT API Key</label>
-                    <input type="text" name="chatgpt_api_key" value="<?php echo htmlspecialchars($settings['chatgpt_api_key'] ?? ''); ?>" placeholder="Enter your ChatGPT API Key (sk-...)">
-                    <div class="help-text">Your OpenAI API key for ChatGPT responses</div>
-                </div>
-                
-                <div class="form-group api-key-group <?php echo (($settings['api_provider'] ?? 'gemini') == 'chatgpt') ? 'show' : ''; ?>" id="system_instruction_group">
-                    <label>System Instruction (for ChatGPT)</label>
-                    <textarea name="system_instruction" placeholder="Enter system instruction for ChatGPT..."><?php echo htmlspecialchars($settings['system_instruction'] ?? ''); ?></textarea>
-                    <div class="help-text">This instruction will be sent as the system message to ChatGPT. It defines the AI's role and behavior.</div>
-                </div>
-                
-                <div class="form-group api-key-group <?php echo (($settings['api_provider'] ?? 'gemini') == 'gemini') ? 'show' : ''; ?>" id="starting_message_group">
-                    <label>Starting Message (for Gemini)</label>
-                    <textarea name="starting_message" placeholder="Enter the starting message that will be added to every AI prompt..."><?php echo htmlspecialchars($settings['starting_message'] ?? ''); ?></textarea>
-                    <div class="help-text">This message will be prepended to every user message before sending to Gemini AI</div>
+
+                <div class="form-group">
+                    <label>Ignore Numbers List (last 6 digits match)</label>
+                    <textarea name="ignore_numbers" placeholder="e.g. 923001112233&#10;03001234567&#10;111222"><?php echo htmlspecialchars($settings['ignore_numbers'] ?? ''); ?></textarea>
+                    <div class="help-text">One number per line (or comma separated). If incoming WhatsApp number last 6 digits match this list, bot will not send any reply.</div>
                 </div>
                 
                 <div class="form-group">
                     <label>WhatsApp API Token</label>
                     <input type="text" name="whatsapp_api_token" value="<?php echo htmlspecialchars($settings['whatsapp_api_token'] ?? ''); ?>" placeholder="Enter your WhatsApp API Token">
-                    <div class="help-text">Your WhatsApp API Bearer token for sending messages</div>
+                    <div class="help-text">Your WhatsApp API Bearer token for sending messages (per store).</div>
                 </div>
                 
                 <div class="form-group">
@@ -268,28 +270,6 @@ $webhook_url = base_url('webhook.php?token=' . ($settings['webhook_token'] ?? ''
                 
                 <button type="submit" name="update_settings">Save Settings</button>
             </form>
-            
-            <script>
-                document.getElementById('api_provider').addEventListener('change', function() {
-                    const provider = this.value;
-                    const geminiGroup = document.getElementById('gemini_key_group');
-                    const chatgptGroup = document.getElementById('chatgpt_key_group');
-                    const systemInstructionGroup = document.getElementById('system_instruction_group');
-                    const startingMessageGroup = document.getElementById('starting_message_group');
-                    
-                    if (provider === 'gemini') {
-                        geminiGroup.classList.add('show');
-                        startingMessageGroup.classList.add('show');
-                        chatgptGroup.classList.remove('show');
-                        systemInstructionGroup.classList.remove('show');
-                    } else {
-                        chatgptGroup.classList.add('show');
-                        systemInstructionGroup.classList.add('show');
-                        geminiGroup.classList.remove('show');
-                        startingMessageGroup.classList.remove('show');
-                    }
-                });
-            </script>
         </div>
     </div>
 </body>

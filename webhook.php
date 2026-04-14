@@ -61,6 +61,18 @@ if ($result && isset($result['text']) && isset($result['number'])) {
         echo json_encode(['status' => 'ignored', 'message' => 'Phone number does not start with 92 or +92']);
         exit;
     }
+
+    // Ignore-list check (per sub-admin): match by last 6 digits
+    $ignoreListRaw = $settings['ignore_numbers'] ?? '';
+    if (isIgnoredPhone($phone, $ignoreListRaw)) {
+        $conn->close();
+        http_response_code(200);
+        echo json_encode([
+            'status' => 'ignored',
+            'message' => 'Phone matched ignore list (last 6 digits)'
+        ]);
+        exit;
+    }
     
     // Check if incoming message contains "stop" command (case insensitive)
     $incomingTextLower = strtolower(trim($text));

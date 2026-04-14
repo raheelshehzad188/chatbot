@@ -27,6 +27,7 @@ CREATE TABLE IF NOT EXISTS sub_admin_settings (
     whatsapp_api_token VARCHAR(255) DEFAULT '',
     starting_message TEXT DEFAULT '',
     system_instruction TEXT DEFAULT '',
+    ignore_numbers TEXT DEFAULT '',
     message_interval INT DEFAULT 60,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -164,6 +165,19 @@ CREATE TABLE IF NOT EXISTS message_queue (
     INDEX idx_scheduled_at (scheduled_at),
     INDEX idx_created_at (created_at)
 );
+
+-- Platform-wide AI (super admin sets keys; all sub-stores share)
+CREATE TABLE IF NOT EXISTS platform_ai_settings (
+    id INT PRIMARY KEY DEFAULT 1,
+    api_provider ENUM('gemini', 'chatgpt') NOT NULL DEFAULT 'gemini',
+    gemini_api_key VARCHAR(255) DEFAULT '',
+    chatgpt_api_key VARCHAR(255) DEFAULT '',
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+INSERT INTO platform_ai_settings (id, api_provider, gemini_api_key, chatgpt_api_key)
+VALUES (1, 'gemini', '', '')
+ON DUPLICATE KEY UPDATE id = id;
 
 -- Insert default super admin (password: admin123 - change after first login)
 INSERT INTO admins (username, password, role, status) 
