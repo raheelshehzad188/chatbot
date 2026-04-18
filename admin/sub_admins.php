@@ -8,6 +8,8 @@ if (!isset($_SESSION['admin_id']) || $_SESSION['admin_role'] != 'super_admin') {
 }
 
 $conn = getDBConnection();
+require_once __DIR__ . '/../functions.php';
+faq_ensure_schema($conn);
 $message = '';
 $edit_admin = null;
 $edit_id = isset($_GET['edit']) ? (int) $_GET['edit'] : 0;
@@ -40,16 +42,31 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['update_admin'])) {
                 $dup->close();
             } else {
                 $dup->close();
+                $category_id = isset($_POST['category_id']) ? (int) $_POST['category_id'] : 0;
+                if ($category_id <= 0) {
+                    $category_id = null;
+                }
                 if ($password !== '') {
                     $hash = password_hash($password, PASSWORD_DEFAULT);
-                    $stmt = $conn->prepare("UPDATE admins SET username = ?, email = ?, status = ?, password = ? WHERE id = ? AND role = 'sub_admin'");
-                    $stmt->bind_param('ssssi', $username, $email, $status, $hash, $edit_id_post);
+                    if ($category_id === null) {
+                        $stmt = $conn->prepare("UPDATE admins SET username = ?, email = ?, status = ?, password = ?, category_id = NULL WHERE id = ? AND role = 'sub_admin'");
+                        $stmt->bind_param('ssssi', $username, $email, $status, $hash, $edit_id_post);
+                    } else {
+                        $stmt = $conn->prepare("UPDATE admins SET username = ?, email = ?, status = ?, password = ?, category_id = ? WHERE id = ? AND role = 'sub_admin'");
+                        $stmt->bind_param('ssssii', $username, $email, $status, $hash, $category_id, $edit_id_post);
+                    }
                 } else {
-                    $stmt = $conn->prepare("UPDATE admins SET username = ?, email = ?, status = ? WHERE id = ? AND role = 'sub_admin'");
-                    $stmt->bind_param('sssi', $username, $email, $status, $edit_id_post);
+                    if ($category_id === null) {
+                        $stmt = $conn->prepare("UPDATE admins SET username = ?, email = ?, status = ?, category_id = NULL WHERE id = ? AND role = 'sub_admin'");
+                        $stmt->bind_param('sssi', $username, $email, $status, $edit_id_post);
+                    } else {
+                        $stmt = $conn->prepare("UPDATE admins SET username = ?, email = ?, status = ?, category_id = ? WHERE id = ? AND role = 'sub_admin'");
+                        $stmt->bind_param('sssii', $username, $email, $status, $category_id, $edit_id_post);
+                    }
                 }
                 if ($stmt->execute()) {
                     $stmt->close();
+                    faq_rebuild_cache_file($edit_id_post);
                     $conn->close();
                     header('Location: sub_admins.php?updated=1');
                     exit;
@@ -73,18 +90,27 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['add_admin'])) {
     
     if (!empty($username) && !empty($password)) {
         $hashed_password = password_hash($password, PASSWORD_DEFAULT);
-        $stmt = $conn->prepare("INSERT INTO admins (username, password, email, role) VALUES (?, ?, ?, 'sub_admin')");
-        $stmt->bind_param("sss", $username, $hashed_password, $email);
-        
+        $category_id = isset($_POST['category_id']) ? (int) $_POST['category_id'] : 0;
+        if ($category_id > 0) {
+            $stmt = $conn->prepare("INSERT INTO admins (username, password, email, role, category_id) VALUES (?, ?, ?, 'sub_admin', ?)");
+            $stmt->bind_param("sssi", $username, $hashed_password, $email, $category_id);
+        } else {
+            $stmt = $conn->prepare("INSERT INTO admins (username, password, email, role) VALUES (?, ?, ?, 'sub_admin')");
+            $stmt->bind_param("sss", $username, $hashed_password, $email);
+        }
+
         if ($stmt->execute()) {
-            $new_admin_id = $conn->insert_id;
-            // Create webhook token
+            $new_admin_id = (int) $conn->insert_id;
+            // Create webhook + test-chat token
             $webhook_token = bin2hex(random_bytes(32));
-            $settings_stmt = $conn->prepare("INSERT INTO sub_admin_settings (admin_id, webhook_token) VALUES (?, ?)");
-            $settings_stmt->bind_param("is", $new_admin_id, $webhook_token);
+            $test_chat_token = bin2hex(random_bytes(24));
+            $settings_stmt = $conn->prepare("INSERT INTO sub_admin_settings (admin_id, webhook_token, test_chat_token) VALUES (?, ?, ?)");
+            $settings_stmt->bind_param("iss", $new_admin_id, $webhook_token, $test_chat_token);
             $settings_stmt->execute();
             $settings_stmt->close();
-            
+
+            faq_rebuild_cache_file($new_admin_id);
+
             $message = "Sub-admin added successfully! Webhook token: " . $webhook_token;
         } else {
             $message = "Error adding sub-admin";
@@ -110,7 +136,7 @@ if (isset($_GET['updated'])) {
 
 // Row being edited (for form)
 if ($edit_id > 0) {
-    $est = $conn->prepare("SELECT id, username, email, status FROM admins WHERE id = ? AND role = 'sub_admin'");
+    $est = $conn->prepare("SELECT id, username, email, status, category_id FROM admins WHERE id = ? AND role = 'sub_admin'");
     $est->bind_param('i', $edit_id);
     $est->execute();
     $edit_admin = $est->get_result()->fetch_assoc();
@@ -120,11 +146,26 @@ if ($edit_id > 0) {
     }
 }
 
+$category_options = [];
+$cr = $conn->query("SELECT id, name FROM store_categories ORDER BY name ASC");
+if ($cr) {
+    while ($row = $cr->fetch_assoc()) {
+        $category_options[] = $row;
+    }
+}
+
 // Get all sub-admins
-$query = "SELECT a.*, s.webhook_token FROM admins a 
+$query = "SELECT a.*, s.webhook_token, s.test_chat_token, c.name AS category_name FROM admins a 
          LEFT JOIN sub_admin_settings s ON a.id = s.admin_id 
+         LEFT JOIN store_categories c ON a.category_id = c.id
          WHERE a.role = 'sub_admin' ORDER BY a.created_at DESC";
 $sub_admins = $conn->query($query)->fetch_all(MYSQLI_ASSOC);
+foreach ($sub_admins as &$sa) {
+    if (empty($sa['test_chat_token']) && !empty($sa['id'])) {
+        $sa['test_chat_token'] = ensure_test_chat_token($conn, (int) $sa['id']);
+    }
+}
+unset($sa);
 $conn->close();
 ?>
 <!DOCTYPE html>
@@ -263,9 +304,11 @@ $conn->close();
     <div class="nav">
         <a href="dashboard.php">Dashboard</a>
         <a href="sub_admins.php">Sub Admins</a>
+        <a href="categories.php">Categories</a>
         <a href="platform_ai.php">Platform AI</a>
         <a href="leads.php">Leads</a>
         <a href="contacts.php">Contacts</a>
+        <a href="faq.php">FAQ</a>
         <a href="settings.php">Settings</a>
     </div>
     <div class="container">
@@ -294,6 +337,15 @@ $conn->close();
                     </select>
                 </div>
                 <div class="form-group">
+                    <label>Category</label>
+                    <select name="category_id">
+                        <option value="">— None —</option>
+                        <?php foreach ($category_options as $c): ?>
+                            <option value="<?php echo (int) $c['id']; ?>" <?php echo ((int) ($edit_admin['category_id'] ?? 0) === (int) $c['id']) ? 'selected' : ''; ?>><?php echo htmlspecialchars($c['name']); ?></option>
+                        <?php endforeach; ?>
+                    </select>
+                </div>
+                <div class="form-group">
                     <label>New password</label>
                     <input type="password" name="password" placeholder="Leave blank to keep current password" autocomplete="new-password">
                 </div>
@@ -317,6 +369,15 @@ $conn->close();
                     <label>Email (Optional)</label>
                     <input type="email" name="email">
                 </div>
+                <div class="form-group">
+                    <label>Category</label>
+                    <select name="category_id">
+                        <option value="">— None —</option>
+                        <?php foreach ($category_options as $c): ?>
+                            <option value="<?php echo (int) $c['id']; ?>"><?php echo htmlspecialchars($c['name']); ?></option>
+                        <?php endforeach; ?>
+                    </select>
+                </div>
                 <button type="submit" name="add_admin">Add Sub-Admin</button>
             </form>
         </div>
@@ -329,8 +390,10 @@ $conn->close();
                     <th>ID</th>
                     <th>Username</th>
                     <th>Email</th>
+                    <th>Category</th>
                     <th>Webhook Token</th>
                     <th>Webhook URL</th>
+                    <th>Test bot</th>
                     <th>Status</th>
                     <th>Actions</th>
                 </tr>
@@ -338,7 +401,7 @@ $conn->close();
             <tbody>
                 <?php if (empty($sub_admins)): ?>
                     <tr>
-                        <td colspan="7" style="text-align: center;">No sub-admins found</td>
+                        <td colspan="9" style="text-align: center;">No sub-admins found</td>
                     </tr>
                 <?php else: ?>
                     <?php foreach ($sub_admins as $admin): ?>
@@ -346,6 +409,7 @@ $conn->close();
                             <td><?php echo $admin['id']; ?></td>
                             <td><?php echo htmlspecialchars($admin['username']); ?></td>
                             <td><?php echo htmlspecialchars($admin['email']); ?></td>
+                            <td><?php echo htmlspecialchars($admin['category_name'] ?? '—'); ?></td>
                             <td><code><?php echo htmlspecialchars($admin['webhook_token'] ?? 'N/A'); ?></code></td>
                             <td class="webhook-url">
                                 <?php if ($admin['webhook_token']): ?>
@@ -355,6 +419,14 @@ $conn->close();
                                     ?>
                                 <?php else: ?>
                                     N/A
+                                <?php endif; ?>
+                            </td>
+                            <td>
+                                <?php if (!empty($admin['test_chat_token'])): ?>
+                                    <?php $turl = base_url('chat_test.php?token=' . urlencode($admin['test_chat_token'])); ?>
+                                    <a href="<?php echo htmlspecialchars($turl); ?>" target="_blank" rel="noopener" style="display:inline-block;padding:6px 12px;background:#28a745;color:#fff;text-decoration:none;border-radius:5px;font-size:13px;font-weight:bold;">Test bot</a>
+                                <?php else: ?>
+                                    —
                                 <?php endif; ?>
                             </td>
                             <td><?php echo ucfirst($admin['status']); ?></td>

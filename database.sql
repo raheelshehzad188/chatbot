@@ -3,8 +3,18 @@ CREATE DATABASE IF NOT EXISTS chatbot_db;
 USE chatbot_db;
 
 -- Create admins table
+CREATE TABLE IF NOT EXISTS store_categories (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(255) NOT NULL,
+    developer_prompt TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    INDEX idx_sc_name (name)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
 CREATE TABLE IF NOT EXISTS admins (
     id INT AUTO_INCREMENT PRIMARY KEY,
+    category_id INT NULL DEFAULT NULL,
     username VARCHAR(100) NOT NULL UNIQUE,
     password VARCHAR(255) NOT NULL,
     email VARCHAR(255) DEFAULT '',
@@ -13,7 +23,9 @@ CREATE TABLE IF NOT EXISTS admins (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     INDEX idx_username (username),
-    INDEX idx_role (role)
+    INDEX idx_role (role),
+    INDEX idx_admins_category (category_id),
+    FOREIGN KEY (category_id) REFERENCES store_categories(id) ON DELETE SET NULL
 );
 
 -- Create sub_admin_settings table
@@ -21,6 +33,7 @@ CREATE TABLE IF NOT EXISTS sub_admin_settings (
     id INT AUTO_INCREMENT PRIMARY KEY,
     admin_id INT NOT NULL,
     webhook_token VARCHAR(100) NOT NULL UNIQUE,
+    test_chat_token VARCHAR(64) DEFAULT NULL,
     api_provider ENUM('gemini', 'chatgpt') DEFAULT 'gemini',
     gemini_api_key VARCHAR(255) DEFAULT '',
     chatgpt_api_key VARCHAR(255) DEFAULT '',
@@ -178,6 +191,34 @@ CREATE TABLE IF NOT EXISTS platform_ai_settings (
 INSERT INTO platform_ai_settings (id, api_provider, gemini_api_key, chatgpt_api_key)
 VALUES (1, 'gemini', '', '')
 ON DUPLICATE KEY UPDATE id = id;
+
+-- Per-store FAQ (optional columns faq_strict_unknown, unknown_question_reply on sub_admin_settings are added by app on first use)
+CREATE TABLE IF NOT EXISTS store_faq (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    sub_admin_id INT NOT NULL,
+    question TEXT NOT NULL,
+    answer TEXT NOT NULL,
+    sort_order INT NOT NULL DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    FOREIGN KEY (sub_admin_id) REFERENCES admins(id) ON DELETE CASCADE,
+    INDEX idx_store_faq_sub (sub_admin_id),
+    INDEX idx_store_faq_sort (sub_admin_id, sort_order)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS pending_questions (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    sub_admin_id INT NOT NULL,
+    customer_phone VARCHAR(32) NOT NULL,
+    message_text TEXT NOT NULL,
+    message_hash CHAR(64) NOT NULL,
+    status ENUM('open','answered','dismissed') NOT NULL DEFAULT 'open',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    answered_at TIMESTAMP NULL DEFAULT NULL,
+    FOREIGN KEY (sub_admin_id) REFERENCES admins(id) ON DELETE CASCADE,
+    INDEX idx_pq_sub_status (sub_admin_id, status),
+    INDEX idx_pq_open_hash (sub_admin_id, message_hash, status)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- Insert default super admin (password: admin123 - change after first login)
 INSERT INTO admins (username, password, role, status) 

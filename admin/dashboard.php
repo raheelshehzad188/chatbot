@@ -46,6 +46,14 @@ $stmt->execute();
 $recent_leads = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
 $stmt->close();
 
+$test_chat_url = '';
+if ($admin_role !== 'super_admin') {
+    require_once __DIR__ . '/../functions.php';
+    faq_ensure_schema($conn);
+    $tt = ensure_test_chat_token($conn, (int) $admin_id);
+    $test_chat_url = base_url('chat_test.php?token=' . urlencode($tt));
+}
+
 $conn->close();
 ?>
 <!DOCTYPE html>
@@ -155,10 +163,12 @@ $conn->close();
         <a href="dashboard.php">Dashboard</a>
         <?php if ($admin_role == 'super_admin'): ?>
             <a href="sub_admins.php">Sub Admins</a>
+            <a href="categories.php">Categories</a>
             <a href="platform_ai.php">Platform AI</a>
         <?php endif; ?>
         <a href="leads.php">Leads</a>
         <a href="contacts.php">Contacts</a>
+        <a href="faq.php">FAQ</a>
         <a href="chatgpt_history.php">ChatGPT History</a>
         <a href="gemini_history.php">Gemini History</a>
         <a href="whatsapp_history.php">WhatsApp History</a>
@@ -170,6 +180,13 @@ $conn->close();
                 <h3>Total Leads</h3>
                 <div class="number"><?php echo $leads_count; ?></div>
             </div>
+            <?php if ($test_chat_url !== ''): ?>
+            <div class="stat-card" style="display:flex;flex-direction:column;justify-content:center;gap:10px;">
+                <h3>Test your bot</h3>
+                <a href="<?php echo htmlspecialchars($test_chat_url); ?>" target="_blank" rel="noopener" class="btn" style="text-align:center;">Open test chat</a>
+                <span style="font-size:12px;color:#666;">FAQ + AI preview (no WhatsApp)</span>
+            </div>
+            <?php endif; ?>
         </div>
         <h2 style="margin-bottom: 15px;">Recent Leads</h2>
         <table>

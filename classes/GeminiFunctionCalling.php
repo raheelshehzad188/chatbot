@@ -391,6 +391,12 @@ function getGeminiReplyWithTools($incomingMessage, $phone, $settings = null)
         $custom .= trim((string) $settings['starting_message']) . "\n\n";
     }
     $systemInstruction = trim($custom . $storeRules);
+    if ($sub_admin_id > 0 && function_exists('faq_build_system_prompt_block')) {
+        $faqBlock = faq_build_system_prompt_block($sub_admin_id);
+        if ($faqBlock !== '') {
+            $systemInstruction .= "\n\nStore FAQ (use when relevant; do not contradict):\n" . $faqBlock;
+        }
+    }
 
     try {
         $pdo = getPDOConnection();
@@ -403,20 +409,32 @@ function getGeminiReplyWithTools($incomingMessage, $phone, $settings = null)
     $generatedText = $svc->run($incomingMessage);
     $apiTime = microtime(true) - $apiStartTime;
 
+    $ctx = function_exists('gemini_resolve_category_context') ? gemini_resolve_category_context($sub_admin_id) : ['id' => null, 'name' => ''];
+    $outgoingReply = $generatedText;
+    if ($generatedText !== '' && trim($generatedText) !== '' && function_exists('filter_gemini_reply_output')) {
+        $outgoingReply = filter_gemini_reply_output(
+            $incomingMessage,
+            $generatedText,
+            $sub_admin_id,
+            $ctx['name'] ?? '',
+            $ctx['id'] ?? null
+        );
+    }
+
     if ($sub_admin_id > 0) {
         $leadName = getLeadName($phone, $sub_admin_id);
         $request_payload = json_encode(
             ['mode' => 'function_calling', 'incoming' => $incomingMessage],
             JSON_UNESCAPED_UNICODE
         );
-        $response_data = json_encode(['reply' => $generatedText], JSON_UNESCAPED_UNICODE);
+        $response_data = json_encode(['reply' => $outgoingReply], JSON_UNESCAPED_UNICODE);
         saveGeminiHistory(
             $sub_admin_id,
             $phone,
             $leadName,
             'reply',
             $incomingMessage,
-            $generatedText ?: 'No response generated',
+            $outgoingReply ?: 'No response generated',
             $request_payload,
             $response_data,
             200,
@@ -430,8 +448,8 @@ function getGeminiReplyWithTools($incomingMessage, $phone, $settings = null)
         'api_provider' => 'gemini',
         'process' => 'Function calling reply completed',
         'api_time' => $apiTime,
-        'final_reply' => $generatedText,
+        'final_reply' => $outgoingReply,
     ]);
 
-    return $generatedText !== '' ? $generatedText : 'Sorry, I could not generate a reply.';
+    return $outgoingReply !== '' ? $outgoingReply : 'Sorry, I could not generate a reply.';
 }

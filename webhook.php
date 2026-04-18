@@ -22,6 +22,20 @@ $result_settings = $stmt->get_result();
 $settings = $result_settings->fetch_assoc();
 $stmt->close();
 
+if ($settings) {
+    faq_ensure_schema($conn);
+    $rid = (int) $settings['admin_id'];
+    $ref = $conn->prepare("SELECT faq_strict_unknown, unknown_question_reply FROM sub_admin_settings WHERE admin_id = ? LIMIT 1");
+    $ref->bind_param("i", $rid);
+    $ref->execute();
+    $extra = $ref->get_result()->fetch_assoc();
+    $ref->close();
+    if (is_array($extra)) {
+        $settings['faq_strict_unknown'] = $extra['faq_strict_unknown'] ?? 0;
+        $settings['unknown_question_reply'] = $extra['unknown_question_reply'] ?? '';
+    }
+}
+
 if (!$settings) {
     $conn->close();
     http_response_code(401);
@@ -126,7 +140,7 @@ if ($result && isset($result['text']) && isset($result['number'])) {
     
     if ($existingLead) {
         // Phone exists - get reply from another function with sub-admin settings
-        $replyMessage = getReplyMessage($text, $phone, $settings);
+        $replyMessage = getReplyMessageWithFaqLayer($text, $phone, $settings);
         
         // Check if reply contains "stop" (case insensitive) - if yes, don't send message
         $replyLower = strtolower($replyMessage);

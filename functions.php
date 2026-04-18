@@ -263,19 +263,25 @@ function getGeminiWelcomeMessage($prompt, $name, $settings = null) {
     
     // Prompt already includes instructions from getWelcomeMessage, use it directly
     $fullPrompt = $prompt;
-    
+
+    $sub_admin_id = ($settings && isset($settings['admin_id'])) ? (int) $settings['admin_id'] : 0;
+    $faqBlock = $sub_admin_id > 0 ? faq_build_system_prompt_block($sub_admin_id) : '';
+
     $postData = [
         'contents' => [
             [
                 'parts' => [
-                    [
-                        'text' => $fullPrompt
-                    ]
-                ]
-            ]
-        ]
+                    ['text' => $fullPrompt],
+                ],
+            ],
+        ],
     ];
-    
+    if ($faqBlock !== '') {
+        $postData['systemInstruction'] = [
+            'parts' => [['text' => "Store FAQ (context for your welcome message):\n" . $faqBlock]],
+        ];
+    }
+
     $ch = curl_init();
     curl_setopt($ch, CURLOPT_URL, $apiUrl);
     curl_setopt($ch, CURLOPT_POST, true);
@@ -295,13 +301,23 @@ function getGeminiWelcomeMessage($prompt, $name, $settings = null) {
     // Parse response
     $responseData = json_decode($response, true);
     
-    // Get sub_admin_id from settings
-    $sub_admin_id = ($settings && isset($settings['admin_id'])) ? $settings['admin_id'] : 0;
-    
     // Extract generated text
     $generatedText = '';
     if (isset($responseData['candidates'][0]['content']['parts'][0]['text'])) {
         $generatedText = trim($responseData['candidates'][0]['content']['parts'][0]['text']);
+    }
+
+    $ctx = gemini_resolve_category_context($sub_admin_id);
+    $outgoingWelcome = $generatedText;
+    if (!$error && $httpCode === 200 && $generatedText !== '') {
+        // $fullPrompt = instruction sent to Gemini; used as "requested" context for the filter
+        $outgoingWelcome = filter_gemini_reply_output(
+            $fullPrompt,
+            $generatedText,
+            $sub_admin_id,
+            $ctx['name'],
+            $ctx['id']
+        );
     }
     
     // Save to database if sub_admin_id is provided and we have a response
@@ -315,7 +331,7 @@ function getGeminiWelcomeMessage($prompt, $name, $settings = null) {
             $name,
             'welcome',
             '',
-            $generatedText ?: 'No response generated',
+            $outgoingWelcome ?: 'No response generated',
             $request_payload,
             $response_data,
             $httpCode,
@@ -331,7 +347,7 @@ function getGeminiWelcomeMessage($prompt, $name, $settings = null) {
     }
     
     if (!empty($generatedText)) {
-        return $generatedText;
+        return $outgoingWelcome;
     }
     
     // Fallback
@@ -637,6 +653,615 @@ function getChatHistory($phone, $sub_admin_id, $limit = 50) {
 }
 
 /**
+ * Store categories (super admin): name + developer_prompt; each sub-admin belongs to one category.
+ */
+function categories_ensure_schema(mysqli $conn) {
+    static $done = false;
+    if ($done) {
+        return;
+    }
+    $done = true;
+
+    $conn->query("CREATE TABLE IF NOT EXISTS store_categories (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        name VARCHAR(255) NOT NULL,
+        developer_prompt TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        INDEX idx_sc_name (name)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+
+    if ($col = $conn->query("SHOW COLUMNS FROM admins LIKE 'category_id'")) {
+        if ($col->num_rows === 0) {
+            @$conn->query("ALTER TABLE admins ADD COLUMN category_id INT NULL DEFAULT NULL");
+        }
+    }
+    @$conn->query("ALTER TABLE admins ADD CONSTRAINT fk_admins_store_category FOREIGN KEY (category_id) REFERENCES store_categories(id) ON DELETE SET NULL");
+
+    $r = @$conn->query("SELECT COUNT(*) AS c FROM store_categories");
+    if ($r) {
+        $row = $r->fetch_assoc();
+        if ($row && (int) $row['c'] === 0) {
+            $conn->query("INSERT INTO store_categories (name, developer_prompt) VALUES ('General', '')");
+        }
+    }
+}
+
+/**
+ * Ensure FAQ tables and sub_admin_settings FAQ columns exist (idempotent).
+ */
+function faq_ensure_schema(mysqli $conn) {
+    static $faqSchemaDone = false;
+    if ($faqSchemaDone) {
+        return;
+    }
+    $faqSchemaDone = true;
+
+    categories_ensure_schema($conn);
+
+    $conn->query("CREATE TABLE IF NOT EXISTS store_faq (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        sub_admin_id INT NOT NULL,
+        question TEXT NOT NULL,
+        answer TEXT NOT NULL,
+        sort_order INT NOT NULL DEFAULT 0,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        FOREIGN KEY (sub_admin_id) REFERENCES admins(id) ON DELETE CASCADE,
+        INDEX idx_store_faq_sub (sub_admin_id),
+        INDEX idx_store_faq_sort (sub_admin_id, sort_order)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+
+    $conn->query("CREATE TABLE IF NOT EXISTS pending_questions (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        sub_admin_id INT NOT NULL,
+        customer_phone VARCHAR(32) NOT NULL,
+        message_text TEXT NOT NULL,
+        message_hash CHAR(64) NOT NULL,
+        status ENUM('open','answered','dismissed') NOT NULL DEFAULT 'open',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        answered_at TIMESTAMP NULL DEFAULT NULL,
+        FOREIGN KEY (sub_admin_id) REFERENCES admins(id) ON DELETE CASCADE,
+        INDEX idx_pq_sub_status (sub_admin_id, status),
+        INDEX idx_pq_open_hash (sub_admin_id, message_hash, status)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+
+    if ($col = $conn->query("SHOW COLUMNS FROM sub_admin_settings LIKE 'faq_strict_unknown'")) {
+        if ($col->num_rows === 0) {
+            @$conn->query("ALTER TABLE sub_admin_settings ADD COLUMN faq_strict_unknown TINYINT(1) NOT NULL DEFAULT 0 AFTER message_interval");
+        }
+    }
+    if ($col = $conn->query("SHOW COLUMNS FROM sub_admin_settings LIKE 'unknown_question_reply'")) {
+        if ($col->num_rows === 0) {
+            @$conn->query("ALTER TABLE sub_admin_settings ADD COLUMN unknown_question_reply TEXT NULL AFTER faq_strict_unknown");
+        }
+    }
+    if ($col = $conn->query("SHOW COLUMNS FROM sub_admin_settings LIKE 'test_chat_token'")) {
+        if ($col->num_rows === 0) {
+            @$conn->query("ALTER TABLE sub_admin_settings ADD COLUMN test_chat_token VARCHAR(64) DEFAULT NULL UNIQUE AFTER webhook_token");
+        }
+    }
+}
+
+/**
+ * Ensure this store has a secret test-chat token (for public test UI, not WhatsApp).
+ */
+function ensure_test_chat_token(mysqli $conn, int $adminId) {
+    faq_ensure_schema($conn);
+    $adminId = (int) $adminId;
+    $stmt = $conn->prepare("SELECT test_chat_token FROM sub_admin_settings WHERE admin_id = ? LIMIT 1");
+    $stmt->bind_param("i", $adminId);
+    $stmt->execute();
+    $row = $stmt->get_result()->fetch_assoc();
+    $stmt->close();
+    $existing = $row['test_chat_token'] ?? '';
+    if ($existing !== null && $existing !== '') {
+        return (string) $existing;
+    }
+    $new = bin2hex(random_bytes(24));
+    $up = $conn->prepare("UPDATE sub_admin_settings SET test_chat_token = ? WHERE admin_id = ?");
+    $up->bind_param("si", $new, $adminId);
+    $up->execute();
+    $up->close();
+    return $new;
+}
+
+/** Fixed sender phone for sandbox test UI (92… passes webhook-style checks; not used for real WhatsApp). */
+function test_chat_sandbox_phone() {
+    return '923000000001';
+}
+
+/**
+ * Load sub_admin row + admin_id for test-chat token (public page / AJAX).
+ *
+ * @return array<string,mixed>|null
+ */
+function load_sub_admin_settings_by_test_chat_token(mysqli $conn, $token) {
+    faq_ensure_schema($conn);
+    $token = trim((string) $token);
+    if ($token === '') {
+        return null;
+    }
+    $stmt = $conn->prepare("SELECT s.*, a.id as admin_id, a.username AS store_username FROM sub_admin_settings s 
+        INNER JOIN admins a ON s.admin_id = a.id 
+        WHERE s.test_chat_token = ? AND a.status = 'active' LIMIT 1");
+    $stmt->bind_param("s", $token);
+    $stmt->execute();
+    $settings = $stmt->get_result()->fetch_assoc();
+    $stmt->close();
+    if (!$settings) {
+        return null;
+    }
+    $rid = (int) $settings['admin_id'];
+    $ref = $conn->prepare("SELECT faq_strict_unknown, unknown_question_reply FROM sub_admin_settings WHERE admin_id = ? LIMIT 1");
+    $ref->bind_param("i", $rid);
+    $ref->execute();
+    $extra = $ref->get_result()->fetch_assoc();
+    $ref->close();
+    if (is_array($extra)) {
+        $settings['faq_strict_unknown'] = $extra['faq_strict_unknown'] ?? 0;
+        $settings['unknown_question_reply'] = $extra['unknown_question_reply'] ?? '';
+    }
+    return $settings;
+}
+
+/**
+ * Normalize text for FAQ matching (lowercase, collapse whitespace).
+ */
+function faq_normalize_text($s) {
+    $s = trim((string) $s);
+    if ($s === '') {
+        return '';
+    }
+    if (function_exists('mb_strtolower')) {
+        $s = mb_strtolower($s, 'UTF-8');
+    } else {
+        $s = strtolower($s);
+    }
+    return preg_replace('/\s+/u', ' ', $s);
+}
+
+function faq_cache_dir() {
+    $dir = __DIR__ . '/cache/faq';
+    if (!is_dir($dir)) {
+        @mkdir($dir, 0755, true);
+    }
+    return $dir;
+}
+
+function faq_cache_file_path($sub_admin_id) {
+    return faq_cache_dir() . '/store_' . (int) $sub_admin_id . '.json';
+}
+
+function faq_category_cache_file_path($category_id) {
+    return faq_cache_dir() . '/category_' . (int) $category_id . '.json';
+}
+
+/**
+ * One JSON file per category: metadata + all sub-admins in that category + their FAQ rows.
+ */
+function category_rebuild_aggregate_cache($category_id) {
+    $category_id = (int) $category_id;
+    if ($category_id <= 0) {
+        return;
+    }
+    $conn = getDBConnection();
+    categories_ensure_schema($conn);
+    faq_ensure_schema($conn);
+
+    $st = $conn->prepare("SELECT id, name, developer_prompt FROM store_categories WHERE id = ? LIMIT 1");
+    $st->bind_param("i", $category_id);
+    $st->execute();
+    $cat = $st->get_result()->fetch_assoc();
+    $st->close();
+    if (!$cat) {
+        $conn->close();
+        return;
+    }
+
+    $st2 = $conn->prepare("SELECT id, username FROM admins WHERE role = 'sub_admin' AND category_id = ? ORDER BY username ASC");
+    $st2->bind_param("i", $category_id);
+    $st2->execute();
+    $subs = $st2->get_result()->fetch_all(MYSQLI_ASSOC);
+    $st2->close();
+
+    $stores = [];
+    $fq = $conn->prepare("SELECT id, question, answer, sort_order FROM store_faq WHERE sub_admin_id = ? ORDER BY sort_order ASC, id ASC");
+    foreach ($subs as $sub) {
+        $sid = (int) $sub['id'];
+        $fq->bind_param("i", $sid);
+        $fq->execute();
+        $fr = $fq->get_result();
+        $faqRows = [];
+        while ($row = $fr->fetch_assoc()) {
+            $faqRows[] = [
+                'id' => (int) $row['id'],
+                'question' => $row['question'],
+                'answer' => $row['answer'],
+                'sort_order' => (int) $row['sort_order'],
+            ];
+        }
+        $stores[] = [
+            'sub_admin_id' => $sid,
+            'username' => $sub['username'],
+            'faq' => $faqRows,
+        ];
+    }
+    $fq->close();
+    $conn->close();
+
+    $payload = [
+        'category_id' => $category_id,
+        'name' => $cat['name'],
+        'developer_prompt' => $cat['developer_prompt'],
+        'built_at' => date('c'),
+        'stores' => $stores,
+    ];
+    @file_put_contents(faq_category_cache_file_path($category_id), json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT), LOCK_EX);
+}
+
+/**
+ * Rebuild every sub-admin store JSON + per-category aggregate JSON (super admin "Recache all").
+ */
+function faq_rebuild_all_stores_and_categories() {
+    $conn = getDBConnection();
+    categories_ensure_schema($conn);
+    faq_ensure_schema($conn);
+    $r = $conn->query("SELECT id FROM admins WHERE role = 'sub_admin'");
+    $ids = [];
+    while ($row = $r->fetch_assoc()) {
+        $ids[] = (int) $row['id'];
+    }
+    $conn->close();
+    foreach ($ids as $id) {
+        faq_rebuild_cache_file($id);
+    }
+    $conn = getDBConnection();
+    $cr = $conn->query("SELECT id FROM store_categories");
+    if ($cr) {
+        while ($row = $cr->fetch_assoc()) {
+            category_rebuild_aggregate_cache((int) $row['id']);
+        }
+    }
+    $conn->close();
+}
+
+/**
+ * Rebuild JSON cache from DB (call after any FAQ or promoted-answer change).
+ */
+function faq_rebuild_cache_file($sub_admin_id) {
+    $sub_admin_id = (int) $sub_admin_id;
+    $conn = getDBConnection();
+    faq_ensure_schema($conn);
+    $items = [];
+    $stmt = $conn->prepare("SELECT id, question, answer, sort_order FROM store_faq WHERE sub_admin_id = ? ORDER BY sort_order ASC, id ASC");
+    $stmt->bind_param("i", $sub_admin_id);
+    $stmt->execute();
+    $res = $stmt->get_result();
+    while ($row = $res->fetch_assoc()) {
+        $items[] = [
+            'id' => (int) $row['id'],
+            'q' => $row['question'],
+            'a' => $row['answer'],
+            'n' => faq_normalize_text($row['question']),
+        ];
+    }
+    $stmt->close();
+
+    $catRow = ['id' => null, 'name' => null, 'developer_prompt' => ''];
+    $cq = $conn->prepare("SELECT c.id, c.name, c.developer_prompt FROM admins a LEFT JOIN store_categories c ON a.category_id = c.id WHERE a.id = ? LIMIT 1");
+    $cq->bind_param("i", $sub_admin_id);
+    $cq->execute();
+    $crow = $cq->get_result()->fetch_assoc();
+    $cq->close();
+    if ($crow && !empty($crow['id'])) {
+        $catRow['id'] = (int) $crow['id'];
+        $catRow['name'] = $crow['name'];
+        $catRow['developer_prompt'] = (string) $crow['developer_prompt'];
+    }
+    $conn->close();
+
+    $payload = [
+        'built_at' => date('c'),
+        'sub_admin_id' => $sub_admin_id,
+        'category_id' => $catRow['id'],
+        'category_name' => $catRow['name'],
+        'developer_prompt' => $catRow['developer_prompt'],
+        'items' => $items,
+    ];
+    @file_put_contents(faq_cache_file_path($sub_admin_id), json_encode($payload, JSON_UNESCAPED_UNICODE), LOCK_EX);
+
+    faq_clear_gemini_tenant_cache($sub_admin_id);
+    if (!empty($catRow['id'])) {
+        category_rebuild_aggregate_cache((int) $catRow['id']);
+    }
+}
+
+/**
+ * Directory for TenantGemini-style per-phone history files (see TenantGeminiChatHistory).
+ */
+function faq_gemini_tenant_cache_dir() {
+    $dir = __DIR__ . '/cache/gemini_tenant';
+    if (!is_dir($dir)) {
+        @mkdir($dir, 0755, true);
+    }
+    return $dir;
+}
+
+/**
+ * Clear on-disk (and Redis) Gemini chat history for one store so the next reply does not use stale context.
+ * Called automatically when FAQ is saved in admin.
+ */
+function faq_clear_gemini_tenant_cache($sub_admin_id) {
+    $sub_admin_id = (int) $sub_admin_id;
+    if ($sub_admin_id <= 0) {
+        return;
+    }
+    $dir = faq_gemini_tenant_cache_dir();
+    $pattern = $dir . DIRECTORY_SEPARATOR . 'history_' . $sub_admin_id . '_*.json';
+    foreach (glob($pattern) ?: [] as $file) {
+        @unlink($file);
+    }
+    foreach (glob($dir . DIRECTORY_SEPARATOR . 'history_' . $sub_admin_id . '_*.json.lock') ?: [] as $lock) {
+        @unlink($lock);
+    }
+
+    if (extension_loaded('redis')) {
+        $host = getenv('REDIS_HOST');
+        if ($host !== false && $host !== '') {
+            try {
+                $r = new Redis();
+                $port = (int) (getenv('REDIS_PORT') ?: 6379);
+                if (@$r->connect($host, $port, 1.5)) {
+                    $pass = getenv('REDIS_PASSWORD');
+                    if ($pass !== false && $pass !== '') {
+                        $r->auth($pass);
+                    }
+                    $prefix = 'tenant_gemini:history_' . $sub_admin_id . '_';
+                    $keys = $r->keys($prefix . '*');
+                    if (is_array($keys) && $keys !== []) {
+                        foreach ($keys as $k) {
+                            $r->del($k);
+                        }
+                    }
+                }
+            } catch (Throwable $e) {
+                // ignore
+            }
+        }
+    }
+}
+
+/**
+ * Plain-text FAQ list for Gemini systemInstruction (always rebuilt from latest faq_load_items_cached).
+ *
+ * @return string non-empty or ''
+ */
+function faq_build_system_prompt_block($sub_admin_id) {
+    $sub_admin_id = (int) $sub_admin_id;
+    if ($sub_admin_id <= 0) {
+        return '';
+    }
+
+    $prefix = '';
+    $conn = getDBConnection();
+    categories_ensure_schema($conn);
+    $cq = $conn->prepare("SELECT c.developer_prompt FROM admins a LEFT JOIN store_categories c ON a.category_id = c.id WHERE a.id = ? LIMIT 1");
+    $cq->bind_param("i", $sub_admin_id);
+    $cq->execute();
+    $cr = $cq->get_result()->fetch_assoc();
+    $cq->close();
+    $conn->close();
+    if ($cr && trim((string) ($cr['developer_prompt'] ?? '')) !== '') {
+        $prefix = trim((string) $cr['developer_prompt']) . "\n\n---\n\n";
+    }
+
+    $items = faq_load_items_cached($sub_admin_id);
+    if ($items === []) {
+        $p = rtrim($prefix);
+        return $p !== '' ? $p : '';
+    }
+    $lines = [];
+    foreach ($items as $it) {
+        $q = isset($it['q']) ? trim((string) $it['q']) : '';
+        $a = isset($it['a']) ? trim((string) $it['a']) : '';
+        if ($q === '' || $a === '') {
+            continue;
+        }
+        $lines[] = 'Q: ' . $q . "\nA: " . $a;
+    }
+    if ($lines === []) {
+        $p = rtrim($prefix);
+        return $p !== '' ? $p : '';
+    }
+    $out = $prefix . implode("\n\n", $lines);
+    $max = 12000;
+    if (strlen($out) > $max) {
+        $out = substr($out, 0, $max) . "\n…";
+    }
+    return $out;
+}
+
+/**
+ * Load FAQ items (from file cache if present and readable; else DB + write cache).
+ *
+ * @return array<int, array{id:int,q:string,a:string,n:string}>
+ */
+function faq_load_items_cached($sub_admin_id) {
+    $sub_admin_id = (int) $sub_admin_id;
+    $path = faq_cache_file_path($sub_admin_id);
+    if (is_readable($path)) {
+        $raw = @file_get_contents($path);
+        $data = json_decode((string) $raw, true);
+        if (is_array($data) && isset($data['items']) && is_array($data['items'])) {
+            return $data['items'];
+        }
+    }
+    faq_rebuild_cache_file($sub_admin_id);
+    $raw = @file_get_contents($path);
+    $data = json_decode((string) $raw, true);
+    return (is_array($data) && isset($data['items']) && is_array($data['items'])) ? $data['items'] : [];
+}
+
+/**
+ * Best matching FAQ answer or null.
+ */
+function faq_find_best_answer($incomingMessage, array $items) {
+    $incoming = faq_normalize_text($incomingMessage);
+    if ($incoming === '' || $items === []) {
+        return null;
+    }
+
+    $bestScore = 0.0;
+    $bestAnswer = null;
+
+    foreach ($items as $it) {
+        $q = isset($it['n']) ? $it['n'] : faq_normalize_text($it['q'] ?? '');
+        if ($q === '') {
+            continue;
+        }
+        if ($incoming === $q) {
+            return $it['a'] ?? '';
+        }
+
+        $score = 0.0;
+        $minLen = min(strlen($incoming), strlen($q));
+        if ($minLen >= 4) {
+            if (strpos($incoming, $q) !== false || strpos($q, $incoming) !== false) {
+                $score = 85.0;
+            }
+        }
+
+        if ($score < 85.0) {
+            similar_text($incoming, $q, $pct);
+            if ($pct > $score) {
+                $score = $pct;
+            }
+        }
+
+        if ($score > $bestScore) {
+            $bestScore = $score;
+            $bestAnswer = $it['a'] ?? '';
+        }
+    }
+
+    if ($bestScore >= 40.0 && $bestAnswer !== null) {
+        return $bestAnswer;
+    }
+    return null;
+}
+
+/**
+ * Heuristic: product URL, order intent, price/stock — allow AI (tools or free-form).
+ */
+function faq_incoming_looks_catalog_related($text) {
+    $t = faq_normalize_text($text);
+    if ($t === '') {
+        return false;
+    }
+    if (preg_match('#https?://#u', $t)) {
+        return true;
+    }
+    if (preg_match('#/(product|products)(/|$)#u', $t)) {
+        return true;
+    }
+    $needles = ['order ', ' order', 'buy ', ' buy', 'price', 'stock', 'quantity', 'qty', 'cart', 'checkout', 'product', 'delivery', 'ship', 'pkr', ' rs ', 'rs.', 'slug'];
+    foreach ($needles as $n) {
+        if (strpos($t, $n) !== false) {
+            return true;
+        }
+    }
+    if (preg_match('/\b\d+\s*(x|×)\s*\d/u', $t)) {
+        return true;
+    }
+    return false;
+}
+
+/**
+ * Save unknown customer question when strict mode is on (dedupe open rows by hash).
+ */
+function faq_save_pending_question($sub_admin_id, $customer_phone, $message_text) {
+    $sub_admin_id = (int) $sub_admin_id;
+    $message_text = trim((string) $message_text);
+    if ($message_text === '') {
+        return;
+    }
+    $hash = hash('sha256', faq_normalize_text($message_text));
+
+    $conn = getDBConnection();
+    faq_ensure_schema($conn);
+
+    $chk = $conn->prepare("SELECT id FROM pending_questions WHERE sub_admin_id = ? AND message_hash = ? AND status = 'open' LIMIT 1");
+    $chk->bind_param("is", $sub_admin_id, $hash);
+    $chk->execute();
+    $exists = $chk->get_result()->fetch_assoc();
+    $chk->close();
+
+    if ($exists) {
+        $conn->close();
+        return;
+    }
+
+    $ins = $conn->prepare("INSERT INTO pending_questions (sub_admin_id, customer_phone, message_text, message_hash) VALUES (?, ?, ?, ?)");
+    $ins->bind_param("isss", $sub_admin_id, $customer_phone, $message_text, $hash);
+    $ins->execute();
+    $ins->close();
+    $conn->close();
+}
+
+/**
+ * FAQ-first replies: match cache → answer; else strict+non-catalog → pending + template; else AI.
+ *
+ * @param array<string,mixed> $ctx Optional: skip_pending_save (bool) for test-chat UI (no DB pending, no WhatsApp).
+ */
+function getReplyMessageWithFaqLayer($incomingMessage, $phone, $settings = null, array $ctx = []) {
+    if ($settings !== null) {
+        $settings = mergePlatformAiSettings($settings);
+    }
+
+    $sub_admin_id = (int) ($settings['admin_id'] ?? 0);
+    if ($sub_admin_id <= 0) {
+        return getReplyMessage($incomingMessage, $phone, $settings);
+    }
+
+    $items = faq_load_items_cached($sub_admin_id);
+    $faqHit = faq_find_best_answer($incomingMessage, $items);
+    if ($faqHit !== null) {
+        logApiInteraction([
+            'phone' => $phone,
+            'incoming_message' => $incomingMessage,
+            'api_provider' => $settings['api_provider'] ?? '',
+            'process' => 'FAQ matched (cache/DB); AI skipped',
+            'final_reply' => $faqHit,
+        ]);
+        return $faqHit;
+    }
+
+    $strict = !empty($settings['faq_strict_unknown']);
+    if ($strict && !faq_incoming_looks_catalog_related($incomingMessage)) {
+        if (empty($ctx['skip_pending_save'])) {
+            faq_save_pending_question($sub_admin_id, $phone, $incomingMessage);
+        }
+        $template = isset($settings['unknown_question_reply']) ? trim((string) $settings['unknown_question_reply']) : '';
+        if ($template === '') {
+            $template = 'Thanks for your message. This question is not in our FAQ yet — our team will add an answer and get back to you soon.';
+        }
+        logApiInteraction([
+            'phone' => $phone,
+            'incoming_message' => $incomingMessage,
+            'api_provider' => $settings['api_provider'] ?? '',
+            'process' => !empty($ctx['skip_pending_save'])
+                ? 'FAQ strict: test UI (pending not saved); AI skipped'
+                : 'FAQ strict: unknown saved to pending_questions; AI skipped',
+            'final_reply' => $template,
+        ]);
+        return $template;
+    }
+
+    return getReplyMessage($incomingMessage, $phone, $settings);
+}
+
+/**
  * Get reply message using Google Gemini or ChatGPT API with sub-admin settings
  */
 function getReplyMessage($incomingMessage, $phone, $settings = null) {
@@ -684,6 +1309,64 @@ function getReplyMessage($incomingMessage, $phone, $settings = null) {
 }
 
 /**
+ * Category id + display name for a sub-admin (for Gemini reply filter).
+ *
+ * @return array{id: int|null, name: string}
+ */
+function gemini_resolve_category_context($sub_admin_id) {
+    $sub_admin_id = (int) $sub_admin_id;
+    if ($sub_admin_id <= 0) {
+        return ['id' => null, 'name' => ''];
+    }
+    $conn = getDBConnection();
+    if (function_exists('categories_ensure_schema')) {
+        categories_ensure_schema($conn);
+    }
+    $st = $conn->prepare('SELECT c.id, c.name FROM admins a LEFT JOIN store_categories c ON a.category_id = c.id WHERE a.id = ? LIMIT 1');
+    $st->bind_param('i', $sub_admin_id);
+    $st->execute();
+    $row = $st->get_result()->fetch_assoc();
+    $st->close();
+    $conn->close();
+    if (!$row || empty($row['id'])) {
+        return ['id' => null, 'name' => ''];
+    }
+    return ['id' => (int) $row['id'], 'name' => trim((string) ($row['name'] ?? ''))];
+}
+
+/**
+ * Post-process every Gemini text reply before it is sent to WhatsApp / test UI / history.
+ *
+ * @param string $requestedMessage Incoming customer text (empty for welcome-only flows)
+ * @param string $geminiRawResponse Raw model output
+ * @param int $sub_admin_id Store owner id
+ * @param string $categoryType Category name (empty if uncategorized)
+ * @param int|null $categoryId Category row id
+ */
+function filter_gemini_reply_output($requestedMessage, $geminiRawResponse, $sub_admin_id, $categoryType = '', $categoryId = null) {
+    // Clean the JSON string (remove extra whitespaces/newlines if any)
+    // $geminiRawResponse sgr { s phle koi extr text hto remove kro phle or } k bd bhi 
+    // Remove any extra text before the first '{' and after the matching '}'
+    $start = strpos($geminiRawResponse, '{');
+    $end = strrpos($geminiRawResponse, '}');
+    if ($start !== false && $end !== false && $end > $start) {
+        $geminiRawResponse = substr($geminiRawResponse, $start, $end - $start + 1);
+    }
+    $cleanedResponse = trim((string) $geminiRawResponse);
+
+    // Decode JSON into associative array
+    $decodedResponse = json_decode($cleanedResponse, true);
+    var_dump($decodedResponse['new_question']);
+    die();
+
+    // Display the array for debugging
+    dd($decodedResponse);
+
+    // Default: pass through. Customize here (regex, length, blocklist, etc.).
+    return 'Testing';//trim($geminiRawResponse);
+}
+
+/**
  * Get reply using Google Gemini API
  */
 function getGeminiReply($incomingMessage, $phone, $settings = null) {
@@ -693,28 +1376,38 @@ function getGeminiReply($incomingMessage, $phone, $settings = null) {
     $apiKey = ($settings && !empty($settings['gemini_api_key'])) ? $settings['gemini_api_key'] : GEMINI_API_KEY;
     $model = ($settings && !empty($settings['gemini_model'])) ? $settings['gemini_model'] : null;
     $apiUrl = getGeminiApiUrl($apiKey, $model);
-    
-    // Prepare message with starting message if available
-    $fullMessage = '';
+
+    $sub_admin_id = ($settings && isset($settings['admin_id'])) ? (int) $settings['admin_id'] : 0;
+
+    // System context: store prompt + latest FAQ (refreshed whenever admin saves FAQ / file cache)
+    $systemParts = [];
     if ($settings && !empty($settings['starting_message'])) {
-        $fullMessage = $settings['starting_message'] . ' client msg: ' . $incomingMessage;
+        $systemParts[] = trim((string) $settings['starting_message']);
     } else {
-        // Default starting message
-        $fullMessage = 'ap as a chatbot kam kr rae ho '.$incomingMessage;
+        $systemParts[] = 'You are a helpful store chat assistant. Reply in the same language as the customer when possible.';
     }
-    
-    // Prepare request data
+    $faqBlock = $sub_admin_id > 0 ? faq_build_system_prompt_block($sub_admin_id) : '';
+    if ($faqBlock !== '') {
+        $systemParts[] = "Store FAQ (follow when relevant; do not contradict):\n" . $faqBlock;
+    }
+    $systemText = implode("\n\n", array_filter($systemParts));
+
+    // User turn = current message only (FAQ lives in systemInstruction so it stays in sync with admin updates)
     $postData = [
         'contents' => [
             [
+                'role' => 'user',
                 'parts' => [
-                    [
-                        'text' => $fullMessage
-                    ]
-                ]
-            ]
-        ]
+                    ['text' => $incomingMessage],
+                ],
+            ],
+        ],
     ];
+    if ($systemText !== '') {
+        $postData['systemInstruction'] = [
+            'parts' => [['text' => $systemText]],
+        ];
+    }
     
     // Log payload before sending
     logApiInteraction([
@@ -751,13 +1444,25 @@ function getGeminiReply($incomingMessage, $phone, $settings = null) {
     $responseData = json_decode($response, true);
     
     // Get sub_admin_id from settings
-    $sub_admin_id = ($settings && isset($settings['admin_id'])) ? $settings['admin_id'] : 0;
+    $sub_admin_id = (int) (($settings && isset($settings['admin_id'])) ? $settings['admin_id'] : 0);
     $leadName = getLeadName($phone, $sub_admin_id);
     
     // Extract generated text from response
     $generatedText = '';
     if (isset($responseData['candidates'][0]['content']['parts'][0]['text'])) {
         $generatedText = $responseData['candidates'][0]['content']['parts'][0]['text'];
+    }
+
+    $ctx = gemini_resolve_category_context($sub_admin_id);
+    $outgoingReply = $generatedText;
+    if (!$error && $httpCode === 200 && is_string($generatedText) && trim($generatedText) !== '') {
+        $outgoingReply = filter_gemini_reply_output(
+            $incomingMessage,
+            $generatedText,
+            $sub_admin_id,
+            $ctx['name'],
+            $ctx['id']
+        );
     }
     
     // Save to database if sub_admin_id is provided and we have a response
@@ -771,7 +1476,7 @@ function getGeminiReply($incomingMessage, $phone, $settings = null) {
             $leadName,
             'reply',
             $incomingMessage,
-            $generatedText ?: 'No response generated',
+            $outgoingReply ?: 'No response generated',
             $request_payload,
             $response_data,
             $httpCode,
@@ -788,7 +1493,8 @@ function getGeminiReply($incomingMessage, $phone, $settings = null) {
         'http_code' => $httpCode,
         'api_time' => $apiTime,
         'response' => $responseData,
-        'error' => $error ? $error : null
+        'error' => $error ? $error : null,
+        'final_reply' => $outgoingReply,
     ]);
     
     // Handle errors
@@ -802,9 +1508,9 @@ function getGeminiReply($incomingMessage, $phone, $settings = null) {
         return "Sorry, I'm having trouble processing your message right now. Please try again later.";
     }
     
-    // Return generated text
-    if (!empty($generatedText)) {
-        return $generatedText;
+    // Return generated text (after filter when model returned content)
+    if (!empty(trim((string) $generatedText))) {
+        return $outgoingReply;
     } else {
         error_log("Gemini API Unexpected Response: " . json_encode($responseData));
         return "Sorry, I couldn't generate a proper response. Please try again.";

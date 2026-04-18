@@ -8,6 +8,8 @@ if (!isset($_SESSION['admin_id'])) {
 }
 
 $conn = getDBConnection();
+require_once __DIR__ . '/../functions.php';
+faq_ensure_schema($conn);
 $admin_id = $_SESSION['admin_id'];
 $message = '';
 
@@ -29,8 +31,9 @@ $stmt->close();
 // If settings don't exist, create them
 if (!$settings) {
     $webhook_token = bin2hex(random_bytes(32));
-    $insert_stmt = $conn->prepare("INSERT INTO sub_admin_settings (admin_id, webhook_token) VALUES (?, ?)");
-    $insert_stmt->bind_param("is", $admin_id, $webhook_token);
+    $test_tok = bin2hex(random_bytes(24));
+    $insert_stmt = $conn->prepare("INSERT INTO sub_admin_settings (admin_id, webhook_token, test_chat_token) VALUES (?, ?, ?)");
+    $insert_stmt->bind_param("iss", $admin_id, $webhook_token, $test_tok);
     $insert_stmt->execute();
     $insert_stmt->close();
     
@@ -49,13 +52,15 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['update_settings'])) {
     $system_instruction = $_POST['system_instruction'] ?? '';
     $ignore_numbers = $_POST['ignore_numbers'] ?? '';
     $message_interval = isset($_POST['message_interval']) ? (int)$_POST['message_interval'] : 60;
+    $faq_strict_unknown = !empty($_POST['faq_strict_unknown']) ? 1 : 0;
+    $unknown_question_reply = $_POST['unknown_question_reply'] ?? '';
     
     // Validate message_interval (minimum 10 seconds, maximum 600 seconds)
     if ($message_interval < 10) $message_interval = 10;
     if ($message_interval > 600) $message_interval = 600;
     
-    $update_stmt = $conn->prepare("UPDATE sub_admin_settings SET whatsapp_api_token = ?, starting_message = ?, system_instruction = ?, ignore_numbers = ?, message_interval = ? WHERE admin_id = ?");
-    $update_stmt->bind_param("ssssii", $whatsapp_token, $starting_message, $system_instruction, $ignore_numbers, $message_interval, $admin_id);
+    $update_stmt = $conn->prepare("UPDATE sub_admin_settings SET whatsapp_api_token = ?, starting_message = ?, system_instruction = ?, ignore_numbers = ?, message_interval = ?, faq_strict_unknown = ?, unknown_question_reply = ? WHERE admin_id = ?");
+    $update_stmt->bind_param("ssssiisi", $whatsapp_token, $starting_message, $system_instruction, $ignore_numbers, $message_interval, $faq_strict_unknown, $unknown_question_reply, $admin_id);
     
     if ($update_stmt->execute()) {
         $message = "Settings updated successfully!";
@@ -71,10 +76,13 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['update_settings'])) {
     $update_stmt->close();
 }
 
+$test_chat_token = ensure_test_chat_token($conn, $admin_id);
+
 $conn->close();
 
 // Get webhook URL
 $webhook_url = base_url('webhook.php?token=' . ($settings['webhook_token'] ?? ''));
+$test_chat_url = base_url('chat_test.php?token=' . urlencode($test_chat_token));
 ?>
 <!DOCTYPE html>
 <html lang="en">
@@ -208,6 +216,7 @@ $webhook_url = base_url('webhook.php?token=' . ($settings['webhook_token'] ?? ''
         <?php endif; ?>
         <a href="leads.php">Leads</a>
         <a href="contacts.php">Contacts</a>
+        <a href="faq.php">FAQ</a>
         <a href="chatgpt_history.php">ChatGPT History</a>
         <a href="gemini_history.php">Gemini History</a>
         <a href="whatsapp_history.php">WhatsApp History</a>
@@ -235,6 +244,16 @@ $webhook_url = base_url('webhook.php?token=' . ($settings['webhook_token'] ?? ''
                 <strong>Your Webhook URL:</strong>
                 <code><?php echo htmlspecialchars($webhook_url); ?></code>
                 <div class="help-text">Use this URL in your WhatsApp webhook configuration</div>
+            </div>
+
+            <div class="webhook-info" style="margin-top:16px;">
+                <strong>Test bot (preview only)</strong>
+                <div class="help-text" style="margin-bottom:10px;">Open a chat screen to try your FAQ + AI without sending WhatsApp. Link is unique to your store — do not share publicly.</div>
+                <code style="word-break:break-all;"><?php echo htmlspecialchars($test_chat_url); ?></code>
+                <div style="margin-top:12px;display:flex;flex-wrap:wrap;gap:10px;align-items:center;">
+                    <a href="<?php echo htmlspecialchars($test_chat_url); ?>" target="_blank" rel="noopener" style="display:inline-block;padding:10px 18px;background:#28a745;color:#fff;text-decoration:none;border-radius:6px;font-weight:bold;">Open test chat</a>
+                    <button type="button" id="copyTestLink" style="padding:10px 16px;background:#6c757d;color:#fff;border:none;border-radius:6px;cursor:pointer;">Copy link</button>
+                </div>
             </div>
             
             <form method="POST" id="settingsForm">
@@ -267,11 +286,39 @@ $webhook_url = base_url('webhook.php?token=' . ($settings['webhook_token'] ?? ''
                     <input type="number" name="message_interval" value="<?php echo htmlspecialchars($settings['message_interval'] ?? 60); ?>" min="10" max="600" required>
                     <div class="help-text">Time interval between messages in seconds (minimum 10, maximum 600). Messages will be queued and sent one by one with this interval.</div>
                 </div>
+
+                <div class="form-group">
+                    <label style="display:flex;align-items:center;gap:8px;font-weight:bold;">
+                        <input type="checkbox" name="faq_strict_unknown" value="1" <?php echo !empty($settings['faq_strict_unknown']) ? 'checked' : ''; ?>>
+                        FAQ strict mode (unknown = no AI)
+                    </label>
+                    <div class="help-text">When enabled: customer messages that <strong>do not</strong> match your <a href="faq.php">FAQ</a> and do not look like a product/order link are <strong>not</strong> sent to AI. They are saved under FAQ → Pending so you can reply later; the customer gets the message below. Product/price/order-style messages still use AI.</div>
+                </div>
+
+                <div class="form-group">
+                    <label>Reply when question is unknown (strict mode)</label>
+                    <textarea name="unknown_question_reply" rows="3" placeholder="e.g. Shukriya — hamari team jald jawab de gi."><?php echo htmlspecialchars($settings['unknown_question_reply'] ?? ''); ?></textarea>
+                    <div class="help-text">Sent to the customer when strict mode is on and their text did not match any FAQ entry. Leave empty for a short default English message.</div>
+                </div>
                 
                 <button type="submit" name="update_settings">Save Settings</button>
             </form>
         </div>
     </div>
+    <script>
+    (function () {
+        var btn = document.getElementById('copyTestLink');
+        if (!btn) return;
+        var url = <?php echo json_encode($test_chat_url, JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_HEX_AMP); ?>;
+        btn.addEventListener('click', function () {
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+                navigator.clipboard.writeText(url).then(function () { btn.textContent = 'Copied!'; setTimeout(function () { btn.textContent = 'Copy link'; }, 2000); });
+            } else {
+                prompt('Copy this URL:', url);
+            }
+        });
+    })();
+    </script>
 </body>
 </html>
 

@@ -1,6 +1,12 @@
 # Local secrets — copy from config.example.php
 config.php
 
+# FAQ file cache (per store)
+cache/faq/
+
+# Optional TenantGemini-style history JSON (cleared when FAQ changes)
+cache/gemini_tenant/
+
 # Logs
 *.log
 

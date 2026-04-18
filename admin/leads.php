@@ -115,6 +115,7 @@ $conn->close();
         <?php endif; ?>
         <a href="leads.php">Leads</a>
         <a href="contacts.php">Contacts</a>
+        <a href="faq.php">FAQ</a>
         <a href="settings.php">Settings</a>
     </div>
     <div class="container">

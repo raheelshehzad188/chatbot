@@ -259,6 +259,7 @@ $conn->close();
         <?php endif; ?>
         <a href="leads.php">Leads</a>
         <a href="contacts.php">Contacts</a>
+        <a href="faq.php">FAQ</a>
         <a href="chatgpt_history.php">ChatGPT History</a>
         <a href="gemini_history.php">Gemini History</a>
         <a href="whatsapp_history.php">WhatsApp History</a>
