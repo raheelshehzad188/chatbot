@@ -1,5 +1,6 @@
 # Local secrets — copy from config.example.php
 config.php
+waapi.local.php
 
 # FAQ file cache (per store)
 cache/faq/
