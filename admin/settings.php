@@ -10,6 +10,7 @@ if (!isset($_SESSION['admin_id'])) {
 $conn = getDBConnection();
 require_once __DIR__ . '/../functions.php';
 faq_ensure_schema($conn);
+store_config_ensure_schema($conn);
 $admin_id = $_SESSION['admin_id'];
 $message = '';
 
@@ -45,13 +46,55 @@ if (!$settings) {
     $stmt->close();
 }
 
+$store_types = store_type_get_definitions($conn, true);
+$store_type_fields_map = [];
+foreach ($store_types as $stDef) {
+    $slug = trim((string) ($stDef['slug'] ?? ''));
+    if ($slug === '') {
+        continue;
+    }
+    $store_type_fields_map[$slug] = store_type_get_fields($conn, $slug, true);
+}
+$first_store_type_slug = '';
+if (!empty($store_types) && !empty($store_types[0]['slug'])) {
+    $first_store_type_slug = (string) $store_types[0]['slug'];
+}
+$selected_store_type = trim((string) ($settings['store_type'] ?? ''));
+if ($selected_store_type === '' || !isset($store_type_fields_map[$selected_store_type])) {
+    $selected_store_type = $first_store_type_slug;
+}
+$stored_dynamic_config = json_decode((string) ($settings['store_type_config_json'] ?? ''), true);
+if (!is_array($stored_dynamic_config)) {
+    $stored_dynamic_config = [];
+}
+
 // Handle update (store owners: WhatsApp + prompts only — AI keys are platform-wide)
 if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['update_settings'])) {
-    $whatsapp_token = $_POST['whatsapp_api_token'] ?? '';
-    $starting_message = $_POST['starting_message'] ?? '';
-    $system_instruction = $_POST['system_instruction'] ?? '';
-    $ignore_numbers = $_POST['ignore_numbers'] ?? '';
-    $message_interval = isset($_POST['message_interval']) ? (int)$_POST['message_interval'] : 60;
+    $selected_store_type = trim((string) ($_POST['store_type'] ?? $selected_store_type));
+    if ($selected_store_type === '' || !isset($store_type_fields_map[$selected_store_type])) {
+        $message = "Please select a valid store type.";
+    }
+    $selected_fields = $store_type_fields_map[$selected_store_type] ?? [];
+    $dynamic_config = [];
+    foreach ($selected_fields as $f) {
+        $fieldKey = trim((string) ($f['field_key'] ?? ''));
+        if ($fieldKey === '') {
+            continue;
+        }
+        $postKey = 'cfg_' . $fieldKey;
+        $value = trim((string) ($_POST[$postKey] ?? ''));
+        if (!empty($f['is_required']) && $value === '') {
+            $message = "Required field missing: " . ($f['field_label'] ?? $fieldKey);
+            break;
+        }
+        $dynamic_config[$fieldKey] = $value;
+    }
+
+    $whatsapp_token = $dynamic_config['whatsapp_api_token'] ?? ($_POST['whatsapp_api_token'] ?? ($settings['whatsapp_api_token'] ?? ''));
+    $starting_message = $dynamic_config['starting_message'] ?? ($_POST['starting_message'] ?? ($settings['starting_message'] ?? ''));
+    $system_instruction = $dynamic_config['system_instruction'] ?? ($_POST['system_instruction'] ?? ($settings['system_instruction'] ?? ''));
+    $ignore_numbers = $_POST['ignore_numbers'] ?? ($settings['ignore_numbers'] ?? '');
+    $message_interval = isset($_POST['message_interval']) ? (int)$_POST['message_interval'] : (int)($settings['message_interval'] ?? 60);
     $faq_strict_unknown = !empty($_POST['faq_strict_unknown']) ? 1 : 0;
     $unknown_question_reply = $_POST['unknown_question_reply'] ?? '';
     
@@ -59,21 +102,28 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['update_settings'])) {
     if ($message_interval < 10) $message_interval = 10;
     if ($message_interval > 600) $message_interval = 600;
     
-    $update_stmt = $conn->prepare("UPDATE sub_admin_settings SET whatsapp_api_token = ?, starting_message = ?, system_instruction = ?, ignore_numbers = ?, message_interval = ?, faq_strict_unknown = ?, unknown_question_reply = ? WHERE admin_id = ?");
-    $update_stmt->bind_param("ssssiisi", $whatsapp_token, $starting_message, $system_instruction, $ignore_numbers, $message_interval, $faq_strict_unknown, $unknown_question_reply, $admin_id);
-    
-    if ($update_stmt->execute()) {
-        $message = "Settings updated successfully!";
-        // Refresh settings
-        $stmt = $conn->prepare($settings_query);
-        $stmt->bind_param("i", $admin_id);
-        $stmt->execute();
-        $settings = $stmt->get_result()->fetch_assoc();
-        $stmt->close();
-    } else {
-        $message = "Error updating settings";
+    if ($message === '') {
+        $dynamic_json = json_encode($dynamic_config, JSON_UNESCAPED_UNICODE);
+        $update_stmt = $conn->prepare("UPDATE sub_admin_settings SET store_type = ?, store_type_config_json = ?, whatsapp_api_token = ?, starting_message = ?, system_instruction = ?, ignore_numbers = ?, message_interval = ?, faq_strict_unknown = ?, unknown_question_reply = ? WHERE admin_id = ?");
+        $update_stmt->bind_param("ssssssissi", $selected_store_type, $dynamic_json, $whatsapp_token, $starting_message, $system_instruction, $ignore_numbers, $message_interval, $faq_strict_unknown, $unknown_question_reply, $admin_id);
+        
+        if ($update_stmt->execute()) {
+            $message = "Settings updated successfully!";
+            // Refresh settings
+            $stmt = $conn->prepare($settings_query);
+            $stmt->bind_param("i", $admin_id);
+            $stmt->execute();
+            $settings = $stmt->get_result()->fetch_assoc();
+            $stmt->close();
+            $stored_dynamic_config = json_decode((string) ($settings['store_type_config_json'] ?? ''), true);
+            if (!is_array($stored_dynamic_config)) {
+                $stored_dynamic_config = [];
+            }
+        } else {
+            $message = "Error updating settings";
+        }
+        $update_stmt->close();
     }
-    $update_stmt->close();
 }
 
 $test_chat_token = ensure_test_chat_token($conn, $admin_id);
@@ -83,6 +133,61 @@ $conn->close();
 // Get webhook URL
 $webhook_url = base_url('webhook.php?token=' . ($settings['webhook_token'] ?? ''));
 $test_chat_url = base_url('chat_test.php?token=' . urlencode($test_chat_token));
+
+$knownColumnFallbackKeys = [
+    'whatsapp_api_token',
+    'starting_message',
+    'system_instruction',
+    'ignore_numbers',
+    'message_interval',
+    'unknown_question_reply',
+];
+$store_type_frontend = [];
+foreach ($store_types as $stDef) {
+    $slug = trim((string) ($stDef['slug'] ?? ''));
+    if ($slug === '') {
+        continue;
+    }
+    $fields = $store_type_fields_map[$slug] ?? [];
+    $entry = [
+        'title' => (string) ($stDef['title'] ?? $slug),
+        'details' => (string) ($stDef['details'] ?? ''),
+        'fields' => [],
+    ];
+    foreach ($fields as $f) {
+        $key = trim((string) ($f['field_key'] ?? ''));
+        if ($key === '') {
+            continue;
+        }
+        $value = '';
+        if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['cfg_' . $key]) && $selected_store_type === $slug) {
+            $value = (string) $_POST['cfg_' . $key];
+        } elseif ($selected_store_type === $slug && array_key_exists($key, $stored_dynamic_config)) {
+            $value = (string) $stored_dynamic_config[$key];
+        } elseif (in_array($key, $knownColumnFallbackKeys, true) && isset($settings[$key])) {
+            $value = (string) $settings[$key];
+        }
+        $options = [];
+        $optRaw = trim((string) ($f['options_json'] ?? ''));
+        if ($optRaw !== '') {
+            $decodedOptions = json_decode($optRaw, true);
+            if (is_array($decodedOptions)) {
+                $options = $decodedOptions;
+            }
+        }
+        $entry['fields'][] = [
+            'key' => $key,
+            'label' => (string) ($f['field_label'] ?? $key),
+            'type' => (string) ($f['field_type'] ?? 'text'),
+            'placeholder' => (string) ($f['placeholder'] ?? ''),
+            'help' => (string) ($f['help_text'] ?? ''),
+            'required' => !empty($f['is_required']),
+            'options' => $options,
+            'value' => $value,
+        ];
+    }
+    $store_type_frontend[$slug] = $entry;
+}
 ?>
 <!DOCTYPE html>
 <html lang="en">
@@ -212,6 +317,7 @@ $test_chat_url = base_url('chat_test.php?token=' . urlencode($test_chat_token));
         <a href="dashboard.php">Dashboard</a>
         <?php if ($_SESSION['admin_role'] == 'super_admin'): ?>
             <a href="sub_admins.php">Sub Admins</a>
+            <a href="store_types.php">Store Types</a>
             <a href="platform_ai.php">Platform AI</a>
         <?php endif; ?>
         <a href="leads.php">Leads</a>
@@ -258,27 +364,29 @@ $test_chat_url = base_url('chat_test.php?token=' . urlencode($test_chat_token));
             
             <form method="POST" id="settingsForm">
                 <div class="form-group">
-                    <label>Starting message (Gemini / prepended context)</label>
-                    <textarea name="starting_message" placeholder="Optional context prepended when the platform uses Gemini..."><?php echo htmlspecialchars($settings['starting_message'] ?? ''); ?></textarea>
-                    <div class="help-text">Used when the platform AI provider is Gemini (or as extra context). Does not replace the platform API key.</div>
+                    <label>Store Type</label>
+                    <select name="store_type" id="storeTypeSelect" required>
+                        <?php if (empty($store_types)): ?>
+                            <option value="">No store type configured</option>
+                        <?php else: ?>
+                            <?php foreach ($store_types as $st): ?>
+                                <?php $slug = (string) ($st['slug'] ?? ''); ?>
+                                <option value="<?php echo htmlspecialchars($slug); ?>" <?php echo $selected_store_type === $slug ? 'selected' : ''; ?>>
+                                    <?php echo htmlspecialchars((string) ($st['title'] ?? $slug)); ?>
+                                </option>
+                            <?php endforeach; ?>
+                        <?php endif; ?>
+                    </select>
+                    <div class="help-text">Store type decides which configuration fields are shown below.</div>
                 </div>
 
-                <div class="form-group">
-                    <label>System instruction (ChatGPT)</label>
-                    <textarea name="system_instruction" placeholder="Role and behavior when the platform uses OpenAI..."><?php echo htmlspecialchars($settings['system_instruction'] ?? ''); ?></textarea>
-                    <div class="help-text">Used when the platform AI provider is ChatGPT. Per-store personality; keys stay on Platform AI.</div>
-                </div>
+                <div class="webhook-info" id="storeTypeDetails" style="display:none;"></div>
+                <div id="dynamicStoreTypeFields"></div>
 
                 <div class="form-group">
                     <label>Ignore Numbers List (last 6 digits match)</label>
                     <textarea name="ignore_numbers" placeholder="e.g. 923001112233&#10;03001234567&#10;111222"><?php echo htmlspecialchars($settings['ignore_numbers'] ?? ''); ?></textarea>
                     <div class="help-text">Comma separated format recommended (example: 923001112233,03001234567,111222). If incoming WhatsApp number last 6 digits match this list, bot will not send any reply.</div>
-                </div>
-                
-                <div class="form-group">
-                    <label>WhatsApp API Token</label>
-                    <input type="text" name="whatsapp_api_token" value="<?php echo htmlspecialchars($settings['whatsapp_api_token'] ?? ''); ?>" placeholder="Enter your WhatsApp API Token">
-                    <div class="help-text">Your WhatsApp API Bearer token for sending messages (per store).</div>
                 </div>
                 
                 <div class="form-group">
@@ -307,6 +415,88 @@ $test_chat_url = base_url('chat_test.php?token=' . urlencode($test_chat_token));
     </div>
     <script>
     (function () {
+        var storeTypeSelect = document.getElementById('storeTypeSelect');
+        var dynamicContainer = document.getElementById('dynamicStoreTypeFields');
+        var storeTypeDetails = document.getElementById('storeTypeDetails');
+        var storeTypeSchema = <?php echo json_encode($store_type_frontend, JSON_UNESCAPED_UNICODE | JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_HEX_AMP); ?>;
+
+        function escHtml(v) {
+            return String(v || '')
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#039;');
+        }
+
+        function renderField(field) {
+            var fieldName = 'cfg_' + field.key;
+            var required = field.required ? ' required' : '';
+            var requiredMark = field.required ? ' <span style="color:#c62828;">*</span>' : '';
+            var help = field.help ? '<div class="help-text">' + escHtml(field.help) + '</div>' : '';
+            var ph = escHtml(field.placeholder || '');
+            var value = field.value == null ? '' : String(field.value);
+            var input = '';
+            if (field.type === 'textarea') {
+                input = '<textarea name="' + escHtml(fieldName) + '" placeholder="' + ph + '"' + required + '>' + escHtml(value) + '</textarea>';
+            } else if (field.type === 'select') {
+                var opts = Array.isArray(field.options) ? field.options : [];
+                input = '<select name="' + escHtml(fieldName) + '"' + required + '>';
+                input += '<option value="">Select</option>';
+                for (var i = 0; i < opts.length; i++) {
+                    var opt = opts[i];
+                    var ov = '';
+                    var ol = '';
+                    if (typeof opt === 'string') {
+                        ov = opt;
+                        ol = opt;
+                    } else if (opt && typeof opt === 'object') {
+                        ov = String(opt.value || '');
+                        ol = String(opt.label || ov);
+                    }
+                    var sel = ov === value ? ' selected' : '';
+                    input += '<option value="' + escHtml(ov) + '"' + sel + '>' + escHtml(ol) + '</option>';
+                }
+                input += '</select>';
+            } else {
+                var typ = ['text', 'number', 'password'].indexOf(field.type) >= 0 ? field.type : 'text';
+                input = '<input type="' + escHtml(typ) + '" name="' + escHtml(fieldName) + '" value="' + escHtml(value) + '" placeholder="' + ph + '"' + required + '>';
+            }
+            return '<div class="form-group"><label>' + escHtml(field.label) + requiredMark + '</label>' + input + help + '</div>';
+        }
+
+        function renderStoreTypeFields() {
+            if (!storeTypeSelect || !dynamicContainer) return;
+            var slug = storeTypeSelect.value || '';
+            var cfg = storeTypeSchema[slug];
+            if (!cfg) {
+                dynamicContainer.innerHTML = '';
+                if (storeTypeDetails) {
+                    storeTypeDetails.style.display = 'none';
+                }
+                return;
+            }
+            if (storeTypeDetails) {
+                if (cfg.details && String(cfg.details).trim() !== '') {
+                    storeTypeDetails.style.display = 'block';
+                    storeTypeDetails.innerHTML = '<strong>' + escHtml(cfg.title || slug) + '</strong><div class="help-text" style="margin-top:8px;">' + escHtml(cfg.details) + '</div>';
+                } else {
+                    storeTypeDetails.style.display = 'none';
+                }
+            }
+            var fields = Array.isArray(cfg.fields) ? cfg.fields : [];
+            var html = '';
+            for (var i = 0; i < fields.length; i++) {
+                html += renderField(fields[i]);
+            }
+            dynamicContainer.innerHTML = html;
+        }
+
+        if (storeTypeSelect) {
+            storeTypeSelect.addEventListener('change', renderStoreTypeFields);
+            renderStoreTypeFields();
+        }
+
         var btn = document.getElementById('copyTestLink');
         if (!btn) return;
         var url = <?php echo json_encode($test_chat_url, JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_HEX_AMP); ?>;

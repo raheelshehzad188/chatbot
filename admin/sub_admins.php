@@ -10,9 +10,20 @@ if (!isset($_SESSION['admin_id']) || $_SESSION['admin_role'] != 'super_admin') {
 $conn = getDBConnection();
 require_once __DIR__ . '/../functions.php';
 faq_ensure_schema($conn);
+store_config_ensure_schema($conn);
 $message = '';
 $edit_admin = null;
 $edit_id = isset($_GET['edit']) ? (int) $_GET['edit'] : 0;
+
+$store_type_defs = store_type_get_definitions($conn, true);
+$store_type_slugs = [];
+foreach ($store_type_defs as $td) {
+    $s = trim((string) ($td['slug'] ?? ''));
+    if ($s !== '') {
+        $store_type_slugs[$s] = true;
+    }
+}
+$default_store_type = !empty($store_type_defs[0]['slug']) ? (string) $store_type_defs[0]['slug'] : '';
 
 // Handle update sub-admin
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['update_admin'])) {
@@ -21,6 +32,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['update_admin'])) {
     $email = $_POST['email'] ?? '';
     $status = ($_POST['status'] ?? 'active') === 'inactive' ? 'inactive' : 'active';
     $password = $_POST['password'] ?? '';
+    $store_type = trim((string) ($_POST['store_type'] ?? ''));
+    if ($store_type === '' || !isset($store_type_slugs[$store_type])) {
+        $store_type = $default_store_type;
+    }
 
     if ($edit_id_post <= 0 || $username === '') {
         $message = 'Invalid update request.';
@@ -66,6 +81,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['update_admin'])) {
                 }
                 if ($stmt->execute()) {
                     $stmt->close();
+                    if ($store_type !== '') {
+                        $stCfg = $conn->prepare("UPDATE sub_admin_settings SET store_type = ? WHERE admin_id = ?");
+                        $stCfg->bind_param("si", $store_type, $edit_id_post);
+                        $stCfg->execute();
+                        $stCfg->close();
+                    }
                     faq_rebuild_cache_file($edit_id_post);
                     $conn->close();
                     header('Location: sub_admins.php?updated=1');
@@ -90,6 +111,10 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['add_admin'])) {
     
     if (!empty($username) && !empty($password)) {
         $hashed_password = password_hash($password, PASSWORD_DEFAULT);
+        $store_type = trim((string) ($_POST['store_type'] ?? ''));
+        if ($store_type === '' || !isset($store_type_slugs[$store_type])) {
+            $store_type = $default_store_type;
+        }
         $category_id = isset($_POST['category_id']) ? (int) $_POST['category_id'] : 0;
         if ($category_id > 0) {
             $stmt = $conn->prepare("INSERT INTO admins (username, password, email, role, category_id) VALUES (?, ?, ?, 'sub_admin', ?)");
@@ -104,8 +129,8 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['add_admin'])) {
             // Create webhook + test-chat token
             $webhook_token = bin2hex(random_bytes(32));
             $test_chat_token = bin2hex(random_bytes(24));
-            $settings_stmt = $conn->prepare("INSERT INTO sub_admin_settings (admin_id, webhook_token, test_chat_token) VALUES (?, ?, ?)");
-            $settings_stmt->bind_param("iss", $new_admin_id, $webhook_token, $test_chat_token);
+            $settings_stmt = $conn->prepare("INSERT INTO sub_admin_settings (admin_id, webhook_token, test_chat_token, store_type) VALUES (?, ?, ?, ?)");
+            $settings_stmt->bind_param("isss", $new_admin_id, $webhook_token, $test_chat_token, $store_type);
             $settings_stmt->execute();
             $settings_stmt->close();
 
@@ -136,7 +161,10 @@ if (isset($_GET['updated'])) {
 
 // Row being edited (for form)
 if ($edit_id > 0) {
-    $est = $conn->prepare("SELECT id, username, email, status, category_id FROM admins WHERE id = ? AND role = 'sub_admin'");
+    $est = $conn->prepare("SELECT a.id, a.username, a.email, a.status, a.category_id, s.store_type
+        FROM admins a
+        LEFT JOIN sub_admin_settings s ON s.admin_id = a.id
+        WHERE a.id = ? AND a.role = 'sub_admin'");
     $est->bind_param('i', $edit_id);
     $est->execute();
     $edit_admin = $est->get_result()->fetch_assoc();
@@ -155,7 +183,7 @@ if ($cr) {
 }
 
 // Get all sub-admins
-$query = "SELECT a.*, s.webhook_token, s.test_chat_token, c.name AS category_name FROM admins a 
+$query = "SELECT a.*, s.webhook_token, s.test_chat_token, s.store_type, c.name AS category_name FROM admins a 
          LEFT JOIN sub_admin_settings s ON a.id = s.admin_id 
          LEFT JOIN store_categories c ON a.category_id = c.id
          WHERE a.role = 'sub_admin' ORDER BY a.created_at DESC";
@@ -305,6 +333,7 @@ $conn->close();
         <a href="dashboard.php">Dashboard</a>
         <a href="sub_admins.php">Sub Admins</a>
         <a href="categories.php">Categories</a>
+        <a href="store_types.php">Store Types</a>
         <a href="platform_ai.php">Platform AI</a>
         <a href="leads.php">Leads</a>
         <a href="contacts.php">Contacts</a>
@@ -346,6 +375,17 @@ $conn->close();
                     </select>
                 </div>
                 <div class="form-group">
+                    <label>Store Type</label>
+                    <select name="store_type" required>
+                        <?php foreach ($store_type_defs as $st): ?>
+                            <?php $slug = (string) ($st['slug'] ?? ''); ?>
+                            <option value="<?php echo htmlspecialchars($slug); ?>" <?php echo (($edit_admin['store_type'] ?? '') === $slug) ? 'selected' : ''; ?>>
+                                <?php echo htmlspecialchars((string) ($st['title'] ?? $slug)); ?>
+                            </option>
+                        <?php endforeach; ?>
+                    </select>
+                </div>
+                <div class="form-group">
                     <label>New password</label>
                     <input type="password" name="password" placeholder="Leave blank to keep current password" autocomplete="new-password">
                 </div>
@@ -378,6 +418,17 @@ $conn->close();
                         <?php endforeach; ?>
                     </select>
                 </div>
+                <div class="form-group">
+                    <label>Store Type</label>
+                    <select name="store_type" required>
+                        <?php foreach ($store_type_defs as $st): ?>
+                            <?php $slug = (string) ($st['slug'] ?? ''); ?>
+                            <option value="<?php echo htmlspecialchars($slug); ?>" <?php echo $slug === $default_store_type ? 'selected' : ''; ?>>
+                                <?php echo htmlspecialchars((string) ($st['title'] ?? $slug)); ?>
+                            </option>
+                        <?php endforeach; ?>
+                    </select>
+                </div>
                 <button type="submit" name="add_admin">Add Sub-Admin</button>
             </form>
         </div>
@@ -391,6 +442,7 @@ $conn->close();
                     <th>Username</th>
                     <th>Email</th>
                     <th>Category</th>
+                    <th>Store Type</th>
                     <th>Webhook Token</th>
                     <th>Webhook URL</th>
                     <th>Test bot</th>
@@ -401,7 +453,7 @@ $conn->close();
             <tbody>
                 <?php if (empty($sub_admins)): ?>
                     <tr>
-                        <td colspan="9" style="text-align: center;">No sub-admins found</td>
+                        <td colspan="10" style="text-align: center;">No sub-admins found</td>
                     </tr>
                 <?php else: ?>
                     <?php foreach ($sub_admins as $admin): ?>
@@ -410,6 +462,7 @@ $conn->close();
                             <td><?php echo htmlspecialchars($admin['username']); ?></td>
                             <td><?php echo htmlspecialchars($admin['email']); ?></td>
                             <td><?php echo htmlspecialchars($admin['category_name'] ?? '—'); ?></td>
+                            <td><?php echo htmlspecialchars((string) ($admin['store_type'] ?? '—')); ?></td>
                             <td><code><?php echo htmlspecialchars($admin['webhook_token'] ?? 'N/A'); ?></code></td>
                             <td class="webhook-url">
                                 <?php if ($admin['webhook_token']): ?>

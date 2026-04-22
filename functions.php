@@ -316,7 +316,8 @@ function getGeminiWelcomeMessage($prompt, $name, $settings = null) {
             $generatedText,
             $sub_admin_id,
             $ctx['name'],
-            $ctx['id']
+            $ctx['id'],
+            false
         );
     }
     
@@ -688,6 +689,155 @@ function categories_ensure_schema(mysqli $conn) {
 }
 
 /**
+ * Store type config schema:
+ * - super admin defines active store types (ecommerce/service/...)
+ * - super admin defines per-type visible + required fields
+ * - sub-admin stores selected type + values JSON in sub_admin_settings
+ */
+function store_config_ensure_schema(mysqli $conn) {
+    static $done = false;
+    if ($done) {
+        return;
+    }
+    $done = true;
+
+    $conn->query("CREATE TABLE IF NOT EXISTS store_type_definitions (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        slug VARCHAR(64) NOT NULL UNIQUE,
+        title VARCHAR(255) NOT NULL,
+        details TEXT NULL,
+        is_active TINYINT(1) NOT NULL DEFAULT 1,
+        sort_order INT NOT NULL DEFAULT 0,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        INDEX idx_std_active_sort (is_active, sort_order, id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+
+    $conn->query("CREATE TABLE IF NOT EXISTS store_type_fields (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        store_type_slug VARCHAR(64) NOT NULL,
+        field_key VARCHAR(100) NOT NULL,
+        field_label VARCHAR(255) NOT NULL,
+        field_type ENUM('text','textarea','number','password','select') NOT NULL DEFAULT 'text',
+        placeholder TEXT NULL,
+        help_text TEXT NULL,
+        options_json TEXT NULL,
+        is_required TINYINT(1) NOT NULL DEFAULT 0,
+        is_active TINYINT(1) NOT NULL DEFAULT 1,
+        sort_order INT NOT NULL DEFAULT 0,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        UNIQUE KEY uniq_store_type_field_key (store_type_slug, field_key),
+        INDEX idx_stf_type_sort (store_type_slug, is_active, sort_order, id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+
+    if ($col = $conn->query("SHOW COLUMNS FROM sub_admin_settings LIKE 'store_type'")) {
+        if ($col->num_rows === 0) {
+            @$conn->query("ALTER TABLE sub_admin_settings ADD COLUMN store_type VARCHAR(64) NULL AFTER test_chat_token");
+        }
+    }
+    if ($col = $conn->query("SHOW COLUMNS FROM sub_admin_settings LIKE 'store_type_config_json'")) {
+        if ($col->num_rows === 0) {
+            @$conn->query("ALTER TABLE sub_admin_settings ADD COLUMN store_type_config_json LONGTEXT NULL AFTER store_type");
+        }
+    }
+
+    $hasTypes = 0;
+    $r = $conn->query("SELECT COUNT(*) AS c FROM store_type_definitions");
+    if ($r) {
+        $row = $r->fetch_assoc();
+        $hasTypes = (int) ($row['c'] ?? 0);
+    }
+    if ($hasTypes === 0) {
+        $conn->query("INSERT INTO store_type_definitions (slug, title, details, is_active, sort_order) VALUES
+            ('ecommerce', 'Ecommerce', 'Product based stores. Can include catalog, stock, price and order related integrations.', 1, 10),
+            ('service', 'Service', 'Service businesses (appointments, bookings, consultation).', 1, 20)");
+    }
+
+    $seedField = $conn->prepare("INSERT IGNORE INTO store_type_fields (store_type_slug, field_key, field_label, field_type, placeholder, help_text, options_json, is_required, is_active, sort_order) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)");
+    if ($seedField) {
+        $rows = [
+            ['ecommerce', 'catalog_provider', 'Catalog Provider', 'select', '', 'Choose where product lookup should happen.', '[{"value":"custom","label":"Custom (local DB)"},{"value":"woo","label":"WooCommerce"},{"value":"shopify","label":"Shopify"}]', 1, 5],
+            ['ecommerce', 'whatsapp_api_token', 'WhatsApp API Token', 'text', 'Enter WhatsApp Bearer token', 'Required for sending messages from this store.', '', 1, 10],
+            ['ecommerce', 'starting_message', 'Starting Message (Gemini context)', 'textarea', 'Optional Gemini context', 'Prepended context when Gemini is used.', '', 0, 20],
+            ['ecommerce', 'system_instruction', 'System Instruction (ChatGPT)', 'textarea', 'Optional ChatGPT instruction', 'Behavior/role context when ChatGPT is used.', '', 0, 30],
+            ['ecommerce', 'shopify_store_url', 'Shopify Store URL', 'text', 'https://your-store.myshopify.com', 'Required when catalog provider is Shopify.', '', 0, 40],
+            ['ecommerce', 'shopify_access_token', 'Shopify Access Token', 'password', 'shpat_xxx', 'Private app/admin API token for Shopify.', '', 0, 50],
+            ['ecommerce', 'shopify_api_version', 'Shopify API Version', 'text', '2024-07', 'Optional. Keep default unless you know your version.', '', 0, 60],
+            ['ecommerce', 'woo_base_url', 'WooCommerce Base URL', 'text', 'https://example.com', 'Required when catalog provider is WooCommerce.', '', 0, 70],
+            ['ecommerce', 'woo_consumer_key', 'WooCommerce Consumer Key', 'password', 'ck_xxx', 'REST API consumer key.', '', 0, 80],
+            ['ecommerce', 'woo_consumer_secret', 'WooCommerce Consumer Secret', 'password', 'cs_xxx', 'REST API consumer secret.', '', 0, 90],
+            ['service', 'whatsapp_api_token', 'WhatsApp API Token', 'text', 'Enter WhatsApp Bearer token', 'Required for sending messages from this store.', '', 1, 10],
+            ['service', 'starting_message', 'Starting Message (Gemini context)', 'textarea', 'Optional Gemini context', 'Prepended context when Gemini is used.', '', 0, 20],
+            ['service', 'system_instruction', 'System Instruction (ChatGPT)', 'textarea', 'Optional ChatGPT instruction', 'Behavior/role context when ChatGPT is used.', '', 0, 30],
+            ['service', 'service_booking_api_url', 'Booking API URL', 'text', 'https://api.example.com/bookings', 'Used for service availability/booking checks.', '', 0, 40],
+            ['service', 'service_booking_api_key', 'Booking API Key', 'password', 'Optional secret key', 'Used when booking API requires authentication.', '', 0, 50],
+        ];
+        foreach ($rows as $row) {
+            $seedField->bind_param(
+                "sssssssii",
+                $row[0],
+                $row[1],
+                $row[2],
+                $row[3],
+                $row[4],
+                $row[5],
+                $row[6],
+                $row[7]
+                ,
+                $row[8]
+            );
+            $seedField->execute();
+        }
+        $seedField->close();
+    }
+}
+
+/**
+ * @return array<int, array<string,mixed>>
+ */
+function store_type_get_definitions(mysqli $conn, $onlyActive = true) {
+    store_config_ensure_schema($conn);
+    $sql = "SELECT id, slug, title, details, is_active, sort_order FROM store_type_definitions";
+    if ($onlyActive) {
+        $sql .= " WHERE is_active = 1";
+    }
+    $sql .= " ORDER BY sort_order ASC, id ASC";
+    $res = $conn->query($sql);
+    if (!$res) {
+        return [];
+    }
+    return $res->fetch_all(MYSQLI_ASSOC);
+}
+
+/**
+ * @return array<int, array<string,mixed>>
+ */
+function store_type_get_fields(mysqli $conn, $storeTypeSlug, $onlyActive = true) {
+    store_config_ensure_schema($conn);
+    $storeTypeSlug = trim((string) $storeTypeSlug);
+    if ($storeTypeSlug === '') {
+        return [];
+    }
+    $sql = "SELECT id, store_type_slug, field_key, field_label, field_type, placeholder, help_text, options_json, is_required, is_active, sort_order
+            FROM store_type_fields
+            WHERE store_type_slug = ?";
+    if ($onlyActive) {
+        $sql .= " AND is_active = 1";
+    }
+    $sql .= " ORDER BY sort_order ASC, id ASC";
+    $stmt = $conn->prepare($sql);
+    if (!$stmt) {
+        return [];
+    }
+    $stmt->bind_param("s", $storeTypeSlug);
+    $stmt->execute();
+    $rows = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+    $stmt->close();
+    return $rows;
+}
+
+/**
  * Ensure FAQ tables and sub_admin_settings FAQ columns exist (idempotent).
  */
 function faq_ensure_schema(mysqli $conn) {
@@ -698,6 +848,7 @@ function faq_ensure_schema(mysqli $conn) {
     $faqSchemaDone = true;
 
     categories_ensure_schema($conn);
+    store_config_ensure_schema($conn);
 
     $conn->query("CREATE TABLE IF NOT EXISTS store_faq (
         id INT AUTO_INCREMENT PRIMARY KEY,
@@ -838,6 +989,64 @@ function faq_category_cache_file_path($category_id) {
 }
 
 /**
+ * FAQ items (cache shape with q/a) → plain Q/A block.
+ */
+function faq_format_items_as_qa_text(array $items) {
+    $lines = [];
+    foreach ($items as $it) {
+        $q = isset($it['q']) ? trim((string) $it['q']) : '';
+        $a = isset($it['a']) ? trim((string) $it['a']) : '';
+        if ($q === '' || $a === '') {
+            continue;
+        }
+        $lines[] = 'Q: ' . $q . "\nA: " . $a;
+    }
+    return implode("\n\n", $lines);
+}
+
+/**
+ * Plain FAQ rows from DB (question/answer keys) → Q/A text.
+ *
+ * @param array<int, array<string,mixed>> $rows
+ */
+function faq_format_db_faq_rows_as_qa_text(array $rows) {
+    $lines = [];
+    foreach ($rows as $row) {
+        $q = isset($row['question']) ? trim((string) $row['question']) : '';
+        $a = isset($row['answer']) ? trim((string) $row['answer']) : '';
+        if ($q === '' || $a === '') {
+            continue;
+        }
+        $lines[] = 'Q: ' . $q . "\nA: " . $a;
+    }
+    return implode("\n\n", $lines);
+}
+
+/**
+ * Single cache string: category + store instructions + FAQ (for JSON file + tooling).
+ */
+function faq_combined_instruction_and_faq_string($categoryDeveloperPrompt, $startingMessage, $systemInstruction, $faqQaText) {
+    $parts = [];
+    $cp = trim((string) $categoryDeveloperPrompt);
+    if ($cp !== '') {
+        $parts[] = "[Category instructions]\n" . $cp;
+    }
+    $sm = trim((string) $startingMessage);
+    if ($sm !== '') {
+        $parts[] = "[Store starting / Gemini context]\n" . $sm;
+    }
+    $si = trim((string) $systemInstruction);
+    if ($si !== '') {
+        $parts[] = "[Store system / ChatGPT]\n" . $si;
+    }
+    $faq = trim((string) $faqQaText);
+    if ($faq !== '') {
+        $parts[] = "[FAQ]\n" . $faq;
+    }
+    return implode("\n\n---\n\n", $parts);
+}
+
+/**
  * One JSON file per category: metadata + all sub-admins in that category + their FAQ rows.
  */
 function category_rebuild_aggregate_cache($category_id) {
@@ -867,6 +1076,8 @@ function category_rebuild_aggregate_cache($category_id) {
 
     $stores = [];
     $fq = $conn->prepare("SELECT id, question, answer, sort_order FROM store_faq WHERE sub_admin_id = ? ORDER BY sort_order ASC, id ASC");
+    $stSet = $conn->prepare("SELECT starting_message, system_instruction FROM sub_admin_settings WHERE admin_id = ? LIMIT 1");
+    $catDev = (string) ($cat['developer_prompt'] ?? '');
     foreach ($subs as $sub) {
         $sid = (int) $sub['id'];
         $fq->bind_param("i", $sid);
@@ -881,13 +1092,31 @@ function category_rebuild_aggregate_cache($category_id) {
                 'sort_order' => (int) $row['sort_order'],
             ];
         }
+        $startMsg = '';
+        $sysInst = '';
+        $stSet->bind_param("i", $sid);
+        $stSet->execute();
+        $setR = $stSet->get_result()->fetch_assoc();
+        if ($setR) {
+            $startMsg = (string) ($setR['starting_message'] ?? '');
+            $sysInst = (string) ($setR['system_instruction'] ?? '');
+        }
+        $faqQaText = faq_format_db_faq_rows_as_qa_text($faqRows);
+        $combined = faq_combined_instruction_and_faq_string($catDev, $startMsg, $sysInst, $faqQaText);
         $stores[] = [
             'sub_admin_id' => $sid,
             'username' => $sub['username'],
             'faq' => $faqRows,
+            'instructions' => [
+                'category_developer_prompt' => $catDev,
+                'starting_message' => $startMsg,
+                'system_instruction' => $sysInst,
+            ],
+            'combined_instruction_and_faq' => $combined,
         ];
     }
     $fq->close();
+    $stSet->close();
     $conn->close();
 
     $payload = [
@@ -959,7 +1188,26 @@ function faq_rebuild_cache_file($sub_admin_id) {
         $catRow['name'] = $crow['name'];
         $catRow['developer_prompt'] = (string) $crow['developer_prompt'];
     }
+
+    $setRow = ['starting_message' => '', 'system_instruction' => ''];
+    $sq = $conn->prepare("SELECT starting_message, system_instruction FROM sub_admin_settings WHERE admin_id = ? LIMIT 1");
+    $sq->bind_param("i", $sub_admin_id);
+    $sq->execute();
+    $srow = $sq->get_result()->fetch_assoc();
+    $sq->close();
+    if ($srow) {
+        $setRow['starting_message'] = (string) ($srow['starting_message'] ?? '');
+        $setRow['system_instruction'] = (string) ($srow['system_instruction'] ?? '');
+    }
     $conn->close();
+
+    $faqQaText = faq_format_items_as_qa_text($items);
+    $combinedInstructionAndFaq = faq_combined_instruction_and_faq_string(
+        $catRow['developer_prompt'],
+        $setRow['starting_message'],
+        $setRow['system_instruction'],
+        $faqQaText
+    );
 
     $payload = [
         'built_at' => date('c'),
@@ -967,6 +1215,12 @@ function faq_rebuild_cache_file($sub_admin_id) {
         'category_id' => $catRow['id'],
         'category_name' => $catRow['name'],
         'developer_prompt' => $catRow['developer_prompt'],
+        'instructions' => [
+            'category_developer_prompt' => $catRow['developer_prompt'],
+            'starting_message' => $setRow['starting_message'],
+            'system_instruction' => $setRow['system_instruction'],
+        ],
+        'combined_instruction_and_faq' => $combinedInstructionAndFaq,
         'items' => $items,
     ];
     @file_put_contents(faq_cache_file_path($sub_admin_id), json_encode($payload, JSON_UNESCAPED_UNICODE), LOCK_EX);
@@ -1033,7 +1287,30 @@ function faq_clear_gemini_tenant_cache($sub_admin_id) {
 }
 
 /**
- * Plain-text FAQ list for Gemini systemInstruction (always rebuilt from latest faq_load_items_cached).
+ * Merged instructions + FAQ string from per-store JSON cache (written by faq_rebuild_cache_file).
+ *
+ * @return string|null non-empty string, or null if missing / legacy cache
+ */
+function faq_load_combined_instruction_and_faq_from_cache($sub_admin_id) {
+    $sub_admin_id = (int) $sub_admin_id;
+    if ($sub_admin_id <= 0) {
+        return null;
+    }
+    $path = faq_cache_file_path($sub_admin_id);
+    if (!is_readable($path)) {
+        return null;
+    }
+    $raw = @file_get_contents($path);
+    $data = json_decode((string) $raw, true);
+    if (!is_array($data)) {
+        return null;
+    }
+    $c = isset($data['combined_instruction_and_faq']) ? trim((string) $data['combined_instruction_and_faq']) : '';
+    return $c !== '' ? $c : null;
+}
+
+/**
+ * Plain-text FAQ list for Gemini systemInstruction: prefers cache file merged block (category + store + FAQ).
  *
  * @return string non-empty or ''
  */
@@ -1041,6 +1318,15 @@ function faq_build_system_prompt_block($sub_admin_id) {
     $sub_admin_id = (int) $sub_admin_id;
     if ($sub_admin_id <= 0) {
         return '';
+    }
+
+    $cached = faq_load_combined_instruction_and_faq_from_cache($sub_admin_id);
+    if ($cached !== null) {
+        $max = 12000;
+        if (strlen($cached) > $max) {
+            return substr($cached, 0, $max) . "\n…";
+        }
+        return $cached;
     }
 
     $prefix = '';
@@ -1342,10 +1628,13 @@ function gemini_resolve_category_context($sub_admin_id) {
  * @param int $sub_admin_id Store owner id
  * @param string $categoryType Category name (empty if uncategorized)
  * @param int|null $categoryId Category row id
+ * @param bool $persistNewFaqFromJson When true and JSON has new_question=1, insert FAQ (reply flows only; false for welcome so prompt text is not stored as question)
  */
-function filter_gemini_reply_output($requestedMessage, $geminiRawResponse, $sub_admin_id, $categoryType = '', $categoryId = null) {
+function filter_gemini_reply_output($requestedMessage, $geminiRawResponse, $sub_admin_id, $categoryType = '', $categoryId = null, $persistNewFaqFromJson = true) {
+    $sub_admin_id = (int) $sub_admin_id;
+    $originalTrim = trim((string) $geminiRawResponse);
+
     // Clean the JSON string (remove extra whitespaces/newlines if any)
-    // $geminiRawResponse sgr { s phle koi extr text hto remove kro phle or } k bd bhi 
     // Remove any extra text before the first '{' and after the matching '}'
     $start = strpos($geminiRawResponse, '{');
     $end = strrpos($geminiRawResponse, '}');
@@ -1354,16 +1643,67 @@ function filter_gemini_reply_output($requestedMessage, $geminiRawResponse, $sub_
     }
     $cleanedResponse = trim((string) $geminiRawResponse);
 
-    // Decode JSON into associative array
     $decodedResponse = json_decode($cleanedResponse, true);
-    var_dump($decodedResponse['new_question']);
-    die();
 
-    // Display the array for debugging
-    dd($decodedResponse);
+    if (!is_array($decodedResponse)) {
+        return $originalTrim !== '' ? $originalTrim : $cleanedResponse;
+    }
+    
 
-    // Default: pass through. Customize here (regex, length, blocklist, etc.).
-    return 'Testing';//trim($geminiRawResponse);
+    // Model returns JSON with ai_answer (and optionally new_question, faq_answer, …)
+    if (array_key_exists('ai_answer', $decodedResponse)) {
+        $aiAnswer = trim((string) ($decodedResponse['ai_answer'] ?? ''));
+        $isNewQuestion = isset($decodedResponse['new_question']) && (int) $decodedResponse['new_question'] === 1;
+
+        if ($persistNewFaqFromJson && $isNewQuestion && $sub_admin_id > 0 && $aiAnswer !== '') {
+            $qText = trim((string) $requestedMessage);
+            if ($qText !== '') {
+                faq_auto_insert_from_gemini_json($sub_admin_id, $qText, $aiAnswer);
+            }
+        }
+
+        if ($aiAnswer !== '') {
+            return $aiAnswer;
+        }
+        $faqAns = isset($decodedResponse['faq_answer']) ? trim((string) $decodedResponse['faq_answer']) : '';
+        if ($faqAns !== '' && strcasecmp($faqAns, 'null') !== 0) {
+            return $faqAns;
+        }
+        return $cleanedResponse;
+    }
+
+    return $cleanedResponse;
+}
+
+/**
+ * Insert FAQ row from Gemini JSON protocol (new_question=1, answer in ai_answer) and rebuild file cache.
+ */
+function faq_auto_insert_from_gemini_json($sub_admin_id, $question, $answer) {
+    $sub_admin_id = (int) $sub_admin_id;
+    if ($sub_admin_id <= 0 || $question === '' || $answer === '') {
+        return;
+    }
+    $conn = getDBConnection();
+    faq_ensure_schema($conn);
+    $chk = $conn->prepare('SELECT id FROM store_faq WHERE sub_admin_id = ? AND question = ? LIMIT 1');
+    $chk->bind_param('is', $sub_admin_id, $question);
+    $chk->execute();
+    $exists = $chk->get_result()->fetch_assoc();
+    $chk->close();
+    if ($exists) {
+        $conn->close();
+        return;
+    }
+    $ins = $conn->prepare('INSERT INTO store_faq (sub_admin_id, question, answer, sort_order) VALUES (?, ?, ?, 99)');
+    $ins->bind_param('iss', $sub_admin_id, $question, $answer);
+    if ($ins->execute()) {
+        $ins->close();
+        $conn->close();
+        faq_rebuild_cache_file($sub_admin_id);
+        return;
+    }
+    $ins->close();
+    $conn->close();
 }
 
 /**

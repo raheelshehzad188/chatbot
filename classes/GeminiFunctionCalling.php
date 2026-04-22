@@ -1,4 +1,5 @@
 <?php
+require_once __DIR__ . '/../stores/StoreCatalogFactory.php';
 
 /**
  * Gemini function calling (tools): get_product_details + place_order with PDO + multi-turn follow-up.
@@ -24,13 +25,31 @@ class GeminiFunctionCalling
     /** @var string */
     protected $systemInstruction;
 
-    public function __construct(PDO $pdo, int $storeId, string $customerPhone, string $apiKey, string $systemInstruction)
+    /** @var StoreCatalogInterface */
+    protected $catalog;
+
+    /** @var string */
+    protected $catalogProvider;
+
+    /**
+     * @param array<string,mixed>|null $settings
+     */
+    public function __construct(PDO $pdo, int $storeId, string $customerPhone, string $apiKey, string $systemInstruction, ?array $settings = null)
     {
         $this->pdo = $pdo;
         $this->storeId = $storeId;
         $this->customerPhone = $customerPhone;
         $this->apiKey = $apiKey;
         $this->systemInstruction = $systemInstruction;
+        $this->catalog = StoreCatalogFactory::make($pdo, $storeId, $settings);
+        $cfg = [];
+        if ($settings && !empty($settings['store_type_config_json'])) {
+            $decoded = json_decode((string) $settings['store_type_config_json'], true);
+            if (is_array($decoded)) {
+                $cfg = $decoded;
+            }
+        }
+        $this->catalogProvider = strtolower(trim((string) ($cfg['catalog_provider'] ?? 'custom')));
     }
 
     /**
@@ -269,42 +288,30 @@ TXT;
         $slug = strtolower(preg_replace('/[^a-zA-Z0-9\-]+/', '-', $slug));
         $slug = trim($slug, '-');
 
-        $sql = 'SELECT id, slug, name, description, price, stock, currency
-                FROM products
-                WHERE sub_admin_id = ? AND slug = ?
-                LIMIT 1';
-        $st = $this->pdo->prepare($sql);
-        $st->execute([$this->storeId, $slug]);
-        $row = $st->fetch(PDO::FETCH_ASSOC);
-        if ($row) {
+        $row = $this->catalog->getSingle($slug);
+        if (is_array($row) && !empty($row)) {
             return [
                 'ok' => true,
                 'product' => $row,
+                'provider' => $this->catalogProvider,
             ];
         }
 
-        $like = '%' . $slug . '%';
-        $sql2 = 'SELECT id, slug, name, description, price, stock, currency
-                 FROM products
-                 WHERE sub_admin_id = ? AND (slug LIKE ? OR LOWER(name) LIKE LOWER(?))
-                 ORDER BY id ASC
-                 LIMIT 5';
-        $st2 = $this->pdo->prepare($sql2);
-        $st2->execute([$this->storeId, $like, $like]);
-        $rows = $st2->fetchAll(PDO::FETCH_ASSOC);
+        $rows = $this->catalog->getSearch($slug, 5);
         if (count($rows) === 1) {
-            return ['ok' => true, 'product' => $rows[0]];
+            return ['ok' => true, 'product' => $rows[0], 'provider' => $this->catalogProvider];
         }
         if (count($rows) > 1) {
             return [
                 'ok' => true,
                 'ambiguous' => true,
+                'provider' => $this->catalogProvider,
                 'matches' => array_map(function ($r) {
                     return [
-                        'slug' => $r['slug'],
-                        'name' => $r['name'],
-                        'price' => $r['price'],
-                        'stock' => $r['stock'],
+                        'slug' => $r['slug'] ?? '',
+                        'name' => $r['name'] ?? '',
+                        'price' => $r['price'] ?? '',
+                        'stock' => $r['stock'] ?? null,
                     ];
                 }, $rows),
             ];
@@ -405,7 +412,7 @@ function getGeminiReplyWithTools($incomingMessage, $phone, $settings = null)
         return getGeminiReply($incomingMessage, $phone, $settings);
     }
 
-    $svc = new GeminiFunctionCalling($pdo, $sub_admin_id, $phone, $apiKey, $systemInstruction);
+    $svc = new GeminiFunctionCalling($pdo, $sub_admin_id, $phone, $apiKey, $systemInstruction, is_array($settings) ? $settings : null);
     $generatedText = $svc->run($incomingMessage);
     $apiTime = microtime(true) - $apiStartTime;
 
